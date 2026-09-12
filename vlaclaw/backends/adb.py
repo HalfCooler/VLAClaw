@@ -37,6 +37,7 @@ from typing import Any, Callable, Protocol
 from vlaclaw.action import Action, describe_action, resolve_coordinate
 from vlaclaw.backends import read_png_size
 from vlaclaw.backends.adb_command import AdbCommandRunner
+from vlaclaw.backends.app_aliases import is_android_package_name, normalize_adb_app_identifier
 from vlaclaw.backends.keycodes import ANDROID_KEYCODE_MAP as _KEYCODE_MAP
 from vlaclaw.backends.keycodes import canonical_key_name
 from vlaclaw.observation import Observation
@@ -541,9 +542,11 @@ class AdbBackend:
         use_scrcpy: bool = False,
         collect_ui_tree: bool = False,
         collect_ui_tree_nodes: bool = False,
+        app_aliases: dict[str, str] | None = None,
     ) -> None:
         self._serial = serial
         self._adb = adb_path
+        self._app_aliases = dict(app_aliases or {})
         self._screen_width = 1080
         self._screen_height = 1920
         self._capture_width = 1080
@@ -1281,6 +1284,17 @@ class AdbBackend:
                 timeout=timeout,
             )
 
+    def _resolve_app_package(self, raw: str, *, action_type: str) -> str:
+        package = normalize_adb_app_identifier(raw, extra_aliases=self._app_aliases)
+        if not is_android_package_name(package):
+            raise ValueError(
+                f"Action {action_type!r} cannot resolve {raw!r} to an Android package. "
+                "Use a package name or add it to adb.app_aliases in config.yaml."
+            )
+        if package != raw:
+            logger.debug("Resolved %s app %r -> %r", action_type, raw, package)
+        return package
+
     # ------------------------------------------------------------------
     # Execute
     # ------------------------------------------------------------------
@@ -1396,18 +1410,17 @@ class AdbBackend:
             pass  # terminal action, no device command
 
         elif t == "open_app":
-            pkg = action.text or ""
-            if pkg:
-                await self._run(
-                    "shell",
-                    "monkey",
-                    "-p",
-                    pkg,
-                    "-c",
-                    "android.intent.category.LAUNCHER",
-                    "1",
-                    timeout=timeout,
-                )
+            pkg = self._resolve_app_package(action.text or "", action_type=t)
+            await self._run(
+                "shell",
+                "monkey",
+                "-p",
+                pkg,
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1",
+                timeout=timeout,
+            )
 
         elif t == "open_deeplink":
             action_result = await self._open_deeplink(action, timeout=timeout)
@@ -1419,9 +1432,8 @@ class AdbBackend:
             action_result = await self._adb_command_runner.execute(action, timeout=timeout)
 
         elif t == "close_app":
-            pkg = action.text or ""
-            if pkg:
-                await self._run("shell", "am", "force-stop", pkg, timeout=timeout)
+            pkg = self._resolve_app_package(action.text or "", action_type=t)
+            await self._run("shell", "am", "force-stop", pkg, timeout=timeout)
 
         else:
             raise ValueError(f"Unsupported action type: {t!r}")

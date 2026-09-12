@@ -48,6 +48,7 @@ class ProviderConfig:
 class AdbConfig:
     serial: str | None = None
     adb_path: str = "adb"
+    app_aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -241,6 +242,7 @@ def load_config(path: Path | None = None) -> CliConfig:
         adb=AdbConfig(
             serial=_optional_string(adb_raw, "serial"),
             adb_path=_optional_string(adb_raw, "adb_path") or "adb",
+            app_aliases=_coerce_app_aliases(adb_raw.get("app_aliases")),
         ),
         max_steps=_coerce_positive_int(raw.get("max_steps"), default=15),
         stagnation_limit=_coerce_non_negative_int(raw.get("stagnation_limit"), default=0),
@@ -279,6 +281,7 @@ def build_backend(config: CliConfig) -> AdbBackend:
         use_scrcpy=False,
         collect_ui_tree=True,
         collect_ui_tree_nodes=True,
+        app_aliases=config.adb.app_aliases,
     )
 
 
@@ -408,7 +411,6 @@ def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         sanitized.append(normalized)
     return sanitized
 
-
 def _coerce_message_content(content: Any) -> str:
     if content is None:
         return ""
@@ -451,6 +453,21 @@ def _require_string(raw: dict[str, Any], key: str) -> str:
     if not value:
         raise ValueError(f"Missing required config key: {key}")
     return value
+
+
+def _coerce_app_aliases(value: Any) -> dict[str, str]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("adb.app_aliases must be a mapping of name to package")
+    aliases: dict[str, str] = {}
+    for raw_name, raw_package in value.items():
+        name = str(raw_name).strip()
+        package = "" if raw_package is None else str(raw_package).strip()
+        if not name or not package:
+            raise ValueError(f"Invalid adb.app_aliases entry: {raw_name!r} -> {raw_package!r}")
+        aliases[name] = package
+    return aliases
 
 
 def _optional_string(raw: dict[str, Any], key: str) -> str | None:

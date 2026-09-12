@@ -982,7 +982,8 @@ class GuiAgent:
                 resampling = getattr(Image, "Resampling", Image)
                 grayscale = img.convert("L").resize(
                     (self._STAGNATION_SSIM_SIZE, self._STAGNATION_SSIM_SIZE),
-                    resampling.BILINEAR,
+                    # Pillow > 10
+                    resampling.Resampling.BILINEAR
                 )
                 pixels = list(grayscale.tobytes())
                 if pixels:

@@ -41,7 +41,8 @@ def scale_image(data: bytes, *, scale_ratio: float = 0.5) -> bytes:
             w, h = img.size
             scaled = img.resize(
                 (max(1, int(w * scale_ratio)), max(1, int(h * scale_ratio))),
-                Image.LANCZOS,
+                # In newer Pillow >10, Image.LANCZOS is moved to this
+                Image.Resampling.LANCZOS,
             )
             buf = io.BytesIO()
             scaled.save(buf, format="PNG")
