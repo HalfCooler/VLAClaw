@@ -1,0 +1,34 @@
+[project]
+name = "vlaclaw"
+version = "0.1.0"
+description = "Slim ADB GUI agent skeleton extracted from GUIClaw"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "openai>=2.8.0",
+    "PyYAML>=6.0",
+    "Pillow>=10.0",
+    "json-repair>=0.57.0,<1.0.0",
+    "jinja2>=3.1.0,<4.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+vlaclaw = "vlaclaw.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vlaclaw"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
