@@ -85,6 +85,7 @@ _ANDROID_PACKAGE_DISPLAY_NAMES: dict[str, str] = {
     "com.ss.android.article.news": "今日头条/Toutiao",
     "com.google.android.youtube": "YouTube",
     "com.bytedance.dreamina": "即梦/Dreamina",
+    "com.hunantv.imgo.activity": "芒果TV/Mango TV",
     # Work & Productivity
     "com.ss.android.lark": "飞书/Lark",
     "com.alibaba.android.rimet": "钉钉/DingTalk",
