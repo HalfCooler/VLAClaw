@@ -1,16 +1,14 @@
-"""Task-difficulty routing for choosing the GUI actor and prompt profile.
+"""Task-difficulty classification for telemetry and planning hints.
 
-A larger model classifies the incoming task as easy, medium, or hard. That
-verdict selects both the actor model and the agent profile for the whole run:
+A larger model may classify the incoming task as easy, medium, or hard.  The
+verdict no longer hands the whole run to the large model: the compact small
+actor remains in control, while the large model is reserved for bounded
+recovery/escalation calls.
 
-* easy   -> small GUI model + ``general_compact``
-* medium -> large model + ``general_compact``
-* hard   -> large model + ``general_e2e``
+* easy/medium/hard -> small GUI model + ``general_compact``
 
-Repeat-plan escalation is unchanged: when the actor is the small model it still
-hands the original step plus a repeat-escalation hint to the large model; when
-the actor is already the large model the same path resubmits that original step
-plus the hint to the same large model.
+Repeat-plan escalation is unchanged: a confirmed repeated plan hands one
+bounded step, plus the escalation hint, to the large model.
 """
 
 from __future__ import annotations
@@ -97,8 +95,8 @@ def format_difficulty_progress(snapshot: dict[str, Any] | DifficultyRoute | None
 
 _DIFFICULTY_ROUTES: dict[TaskDifficulty, tuple[bool, str]] = {
     "easy": (False, "general_compact"),
-    "medium": (True, "general_compact"),
-    "hard": (True, "general_e2e"),
+    "medium": (False, "general_compact"),
+    "hard": (False, "general_compact"),
 }
 
 
@@ -192,7 +190,7 @@ async def judge_task_difficulty(llm: Any, task: str) -> DifficultyVerdict:
         response = await llm.chat(
             messages=[{"role": "user", "content": prompt}],
             tools=None,
-            max_tokens=256,
+            max_tokens=96,
         )
     except Exception as exc:
         logger.warning("Difficulty judge failed; treating as medium: %s", exc)

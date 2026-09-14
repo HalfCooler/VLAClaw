@@ -130,22 +130,24 @@ class TrajectoryRecorder:
         self._write_json(self._path, trajectory)
 
     def record_event(self, event_type: str, **payload: Any) -> None:
-        """Publish a lifecycle event without persisting verbose event payloads."""
+        """Persist and publish a compact lifecycle/controller event."""
         if self._path is None:
             raise RuntimeError("Recorder not started; call start() first")
         if self._closed:
             raise RuntimeError("Recorder already closed")
         self._capture_skill_event(event_type, payload)
         self._capture_initial_skill_selector_event(event_type, payload)
-        self._emit(
-            {
-                "type": event_type,
-                "at_step": self._step_count,
-                "subtask": self.subtask_index,
-                "attempt": self._attempt,
-                **payload,
-            }
-        )
+        event = {
+            "type": event_type,
+            "at_step": self._step_count,
+            "subtask": self.subtask_index,
+            "attempt": self._attempt,
+            **payload,
+        }
+        trajectory = self._require_trajectory()
+        trajectory.setdefault("events", []).append(event)
+        self._write_json(self._path, trajectory)
+        self._emit(event)
 
     def _capture_initial_skill_selector_event(
         self,
@@ -309,6 +311,7 @@ class TrajectoryRecorder:
                 payload.setdefault("subtasks", [])
                 payload.setdefault("steps", [])
                 payload.setdefault("screenshots", [])
+                payload.setdefault("events", [])
                 return payload
         return {
             "instruction": self.instruction or self.task,
@@ -316,6 +319,7 @@ class TrajectoryRecorder:
             "subtasks": [],
             "steps": [],
             "screenshots": [],
+            "events": [],
         }
 
     def _load_result(self) -> dict[str, Any]:
@@ -491,6 +495,12 @@ def load_trajectory_events(
             "subtask": subtask_index,
         }
     ]
+    events.extend(
+        dict(event)
+        for event in payload.get("events", [])
+        if isinstance(event, dict)
+        and (subtask_index is None or event.get("subtask") == subtask_index)
+    )
     for step in payload.get("steps", []):
         if not isinstance(step, dict):
             continue

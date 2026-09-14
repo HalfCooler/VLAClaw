@@ -1724,6 +1724,9 @@ def _parse_ui_tree_xml(
         focused = element.get("focused") == "true"
         enabled = element.get("enabled") == "true"
         scrollable = element.get("scrollable") == "true"
+        checkable = element.get("checkable") == "true"
+        checked = element.get("checked") == "true"
+        selected = element.get("selected") == "true"
         if enabled:
             enabled_present = True
         if scrollable:
@@ -1758,6 +1761,9 @@ def _parse_ui_tree_xml(
                 or focused
                 or enabled
                 or scrollable
+                or checkable
+                or checked
+                or selected
             )
         ):
             compact_node: dict[str, Any] = {}
@@ -1777,6 +1783,13 @@ def _parse_ui_tree_xml(
                 compact_node["enabled"] = True
             if scrollable:
                 compact_node["scrollable"] = True
+            if checkable:
+                compact_node["checkable"] = True
+                compact_node["checked"] = checked
+            elif checked:
+                compact_node["checked"] = True
+            if selected:
+                compact_node["selected"] = True
             if bounds:
                 compact_node["bounds"] = bounds
             ui_tree.append(compact_node)

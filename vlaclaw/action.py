@@ -24,7 +24,7 @@ import typing
 VALID_ACTION_TYPES: frozenset[str] = frozenset({
     "tap", "long_press", "double_tap", "drag", "swipe", "scroll",
     "click_multi", "click_then_type",
-    "input_text", "hotkey", "screenshot", "wait",
+    "input_text", "hotkey", "screenshot", "inspect", "wait",
     "open_app", "open_deeplink", "open_intent", "adb_command", "close_app", "back", "home", "enter", "app_switch", "done",
     "request_intervention",
 })
@@ -47,7 +47,7 @@ _ACTION_ALIASES: dict[str, str] = {
 _RELATIVE_GRID_MAX: int = 999
 
 _XY_REQUIRED: frozenset[str] = frozenset(
-    {"tap", "long_press", "double_tap", "drag", "swipe"},
+    {"tap", "long_press", "double_tap", "drag", "swipe", "inspect"},
 )
 _XY2_REQUIRED: frozenset[str] = frozenset({"drag", "swipe"})
 _VALID_SCROLL_DIRECTIONS: frozenset[str] = frozenset(
@@ -239,6 +239,8 @@ def describe_action(action: Action) -> str:
         return f"request intervention: {preview}"
     if t == "screenshot":
         return "take screenshot"
+    if t == "inspect":
+        return f"inspect at {_fmt_coord(action)}"
     if t == "wait":
         return f"wait {action.duration_ms} ms" if action.duration_ms else "wait"
     if t == "back":

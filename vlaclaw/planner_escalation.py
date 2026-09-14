@@ -23,12 +23,19 @@ REPEAT_JUDGE_MODELS: tuple[str, ...] = ("small", "large")
 REPEAT_UI_TREE_DIFFERENCE_LIMIT = 0.05
 REPEAT_ESCALATION_HINT_PREFIX = "REPEAT ESCALATION:"
 
-_SKIP_REPEAT_CHECK_TYPES = frozenset({"done", "request_intervention"})
+_SKIP_REPEAT_CHECK_TYPES = frozenset({"done", "inspect", "request_intervention"})
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 _TRUE_VALUES = frozenset({"true", "yes", "y", "1", "repeat", "repeated"})
 _FALSE_VALUES = frozenset({"false", "no", "n", "0"})
 _NODE_TEXT_FIELDS = ("resource_id", "class", "text", "content_desc")
-_NODE_FLAG_FIELDS = ("clickable", "scrollable", "enabled")
+_NODE_FLAG_FIELDS = (
+    "clickable",
+    "scrollable",
+    "enabled",
+    "checkable",
+    "checked",
+    "selected",
+)
 
 @dataclass(frozen=True)
 class RepeatVerdict:

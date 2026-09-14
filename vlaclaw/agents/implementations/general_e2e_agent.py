@@ -68,7 +68,7 @@ def parse_response_to_action(
             [scale_factor, scale_factor] if isinstance(scale_factor, int) else scale_factor
         )
 
-        if action_type in ["click", "double_tap", "long_press"]:
+        if action_type in ["click", "double_tap", "long_press", "inspect"]:
             if "coordinate" not in action_data:
                 raise ValueError(f"Missing coordinate for action type: {action_type}")
             coord = action_data["coordinate"]

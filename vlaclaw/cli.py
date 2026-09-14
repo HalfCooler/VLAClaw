@@ -30,6 +30,8 @@ from vlaclaw.trajectory.recorder import TrajectoryRecorder
 
 logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = Path.home() / ".vlaclaw" / "config.yaml"
+SMALL_MODEL_MAX_TOKENS = 48
+LARGE_MODEL_MAX_TOKENS = 96
 
 
 @dataclass(slots=True)
@@ -62,7 +64,7 @@ class CliConfig:
     history_image_window: int | None = None
     enable_repeat_escalation: bool = True
     repeat_judge_model: str = "small"
-    enable_difficulty_routing: bool = True
+    enable_difficulty_routing: bool = False
     agent_profile: str | None = None
 
 
@@ -78,6 +80,7 @@ class OpenAICompatibleLLMProvider:
         vl_high_resolution_images: bool | None = None,
         reasoning_effort: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        hard_max_tokens: int | None = None,
     ) -> None:
         self._base_url = base_url
         self._model = model
@@ -86,6 +89,9 @@ class OpenAICompatibleLLMProvider:
         self._vl_high_resolution_images = vl_high_resolution_images
         self._reasoning_effort = reasoning_effort
         self._extra_body = dict(extra_body or {})
+        self._hard_max_tokens = (
+            max(1, int(hard_max_tokens)) if hard_max_tokens is not None else None
+        )
         self._client = AsyncOpenAI(api_key=api_key or "no-key", base_url=base_url)
 
     async def chat(
@@ -105,8 +111,15 @@ class OpenAICompatibleLLMProvider:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+        effective_max_tokens = max_tokens
+        if self._hard_max_tokens is not None:
+            effective_max_tokens = (
+                self._hard_max_tokens
+                if effective_max_tokens is None
+                else min(int(effective_max_tokens), self._hard_max_tokens)
+            )
+        if effective_max_tokens is not None:
+            kwargs["max_tokens"] = effective_max_tokens
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
         if self._top_p is not None:
@@ -166,7 +179,11 @@ class OpenAICompatibleLLMProvider:
         )
 
 
-def build_llm_provider(config: ProviderConfig) -> OpenAICompatibleLLMProvider:
+def build_llm_provider(
+    config: ProviderConfig,
+    *,
+    hard_max_tokens: int | None = None,
+) -> OpenAICompatibleLLMProvider:
     return OpenAICompatibleLLMProvider(
         base_url=config.base_url,
         model=config.model,
@@ -176,6 +193,7 @@ def build_llm_provider(config: ProviderConfig) -> OpenAICompatibleLLMProvider:
         vl_high_resolution_images=config.vl_high_resolution_images,
         reasoning_effort=config.reasoning_effort,
         extra_body=config.extra_body,
+        hard_max_tokens=hard_max_tokens,
     )
 
 
@@ -250,7 +268,7 @@ def load_config(path: Path | None = None) -> CliConfig:
         history_image_window=_coerce_optional_positive_int(raw.get("history_image_window")),
         enable_repeat_escalation=_coerce_bool(raw.get("enable_repeat_escalation"), default=True),
         repeat_judge_model=_coerce_repeat_judge_model(raw.get("repeat_judge_model")),
-        enable_difficulty_routing=_coerce_bool(raw.get("enable_difficulty_routing"), default=True),
+        enable_difficulty_routing=_coerce_bool(raw.get("enable_difficulty_routing"), default=False),
         agent_profile=_optional_string(raw, "agent_profile"),
     )
 
@@ -294,12 +312,15 @@ async def _execute_agent(
 ) -> AgentResult:
     run_root = DEFAULT_GUI_RUNS_DIR / datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S_%f")
     large_llm = (
-        build_llm_provider(config.postprocess_provider)
+        build_llm_provider(
+            config.postprocess_provider,
+            hard_max_tokens=LARGE_MODEL_MAX_TOKENS,
+        )
         if config.postprocess_provider is not None
         and (config.enable_repeat_escalation or config.enable_difficulty_routing)
         else None
     )
-    explicit_profile = args.agent_profile
+    explicit_profile = args.agent_profile or config.agent_profile
     difficulty_route = await resolve_difficulty_route(
         task=task,
         enabled=config.enable_difficulty_routing,
@@ -341,6 +362,10 @@ async def _execute_agent(
         enable_repeat_escalation=config.enable_repeat_escalation,
         repeat_judge_model=config.repeat_judge_model,
         difficulty_snapshot=difficulty_snapshot,
+        planner_model=(
+            config.postprocess_provider.model if config.postprocess_provider is not None else ""
+        ),
+        planner_max_tokens=LARGE_MODEL_MAX_TOKENS,
         image_scale_ratio=config.image_scale_ratio,
         history_image_window=config.history_image_window,
         stagnation_limit=config.stagnation_limit,
@@ -353,7 +378,7 @@ async def run_cli(args: argparse.Namespace) -> AgentResult:
     task = resolve_task(args)
     config = load_config(args.config)
     backend = build_backend(config)
-    provider = build_llm_provider(config.provider)
+    provider = build_llm_provider(config.provider, hard_max_tokens=SMALL_MODEL_MAX_TOKENS)
     return await _execute_agent(args, config, backend, provider, task)
 
 

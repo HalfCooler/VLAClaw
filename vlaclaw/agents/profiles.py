@@ -36,13 +36,14 @@ from vlaclaw.agents.utils.prompts import (
 from vlaclaw.image_utils import normalize_image_scale_ratio
 from vlaclaw.interfaces import LLMResponse, ToolCall
 from vlaclaw.observation import Observation
+from vlaclaw.social_state import like_task_policy
 
 SUPPORTED_AGENT_PROFILES: tuple[str, ...] = ("general_compact", "general_e2e")
 _CLAUDE_IMAGE_SIZE = (1280, 720)
 _CLAUDE_OPUS_MAX_DIMENSION = 1280
 DEFAULT_SCROLL_PIXELS = 400
 _PROFILE_LLM_DEFAULTS: dict[str, dict[str, Any]] = {
-    "general_compact": {"reasoning_effort": "none", "max_tokens": 256},
+    "general_compact": {"reasoning_effort": "none", "max_tokens": 48},
 }
 
 
@@ -235,6 +236,8 @@ def _build_general_e2e_messages(
     image_scale_ratio: float = 1.0,
     rolling_memory_history: bool = False,
 ) -> list[dict[str, Any]]:
+    task_policy = like_task_policy(task)
+    task_instruction = f"{task}\n\n{task_policy}" if task_policy else task
     observations = [turn.observation for turn in history] + [current_observation]
     tool_results = [turn.tool_result_message.get("content") for turn in history]
     scale_factor = _general_e2e_scale_factor(
@@ -259,7 +262,7 @@ def _build_general_e2e_messages(
     }
     if rolling_memory_history:
         latest_memory = _general_compact_history_memory(history)
-        instruction_parts = [f"Instruction: {task}"]
+        instruction_parts = [f"Instruction: {task_instruction}"]
         if latest_memory:
             instruction_parts.extend(["", f"Memory state:\n{latest_memory}"])
         return [
@@ -279,7 +282,7 @@ def _build_general_e2e_messages(
         _general_user_message(
             observations[0],
             tool_result=None,
-            instruction=task,
+            instruction=task_instruction,
             model_name=model_name,
             image_scale_ratio=image_scale_ratio,
         ),
@@ -625,6 +628,8 @@ def _to_guiclaw_payload(action: dict[str, Any], *, summary: str) -> dict[str, An
         payload.update({"action_type": "wait"})
         if action.get("duration_ms") is not None:
             payload["duration_ms"] = action["duration_ms"]
+    elif action_type == "inspect":
+        payload.update({"action_type": "inspect", "x": action.get("x"), "y": action.get("y")})
     elif action_type in {ANSWER, FINISHED, "answer", "finished"}:
         payload.update(
             {"action_type": "done", "status": _done_status(action), "text": action.get("text", "")}
