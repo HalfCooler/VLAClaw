@@ -113,7 +113,10 @@ _PAYMENT_APP_MARKERS = (
 )
 _PAYMENT_APP_TASK_NAMES = ("alipay", "支付宝", "云闪付", "unionpay")
 _PLAY_TASK_RE = re.compile(r"继续观看|继续播放|播放|观看|看.+视频|听.+(?:歌|音乐|音频)")
-_PLAYBACK_EVIDENCE_RE = re.compile(r"试看\s*\d*\s*分钟|正在播放|播放中|暂停播放")
+_PLAYBACK_EVIDENCE_RE = re.compile(
+    r"试看\s*\d*\s*分钟|正在播放|播放中|暂停(?:播放)?|\bplaying\b|\bpaused?\b",
+    re.IGNORECASE,
+)
 
 _COORDINATE_ACTIONS = frozenset(
     {
@@ -220,7 +223,7 @@ def guard_action(
     if _is_payment_app(app) and not (
         contract.authorizes("financial") or contract.mentions_payment_app()
     ):
-        goal_satisfied = _playback_goal_evidence(contract.task, page_text)
+        goal_satisfied = playback_goal_satisfied(contract.task, observation)
         return GuardVerdict(
             False,
             "payment_app_outside_task_scope",
@@ -257,7 +260,7 @@ def guard_action(
             target_text=target_text,
             target_node=target_node,
             goal_already_satisfied=(
-                (effect == "financial" and _playback_goal_evidence(contract.task, page_text))
+                (effect == "financial" and playback_goal_satisfied(contract.task, observation))
                 or (effect == "like_off" and contract.authorizes("like_on"))
             ),
         )
@@ -384,6 +387,7 @@ def observation_state_id(observation: Observation) -> str:
         "app": observation.foreground_app or "unknown",
         "resolution": [observation.screen_width, observation.screen_height],
         "semantic": semantic,
+        "media_playback": observation.extra.get("media_playback"),
         "visual": _visual_average_hash(observation.screenshot_path),
     }
     digest = hashlib.sha256(
@@ -499,8 +503,24 @@ def _is_payment_app(app: str) -> bool:
     return any(marker in normalized for marker in _PAYMENT_APP_MARKERS)
 
 
-def _playback_goal_evidence(task: str, page_text: str) -> bool:
-    return bool(_PLAY_TASK_RE.search(task or "") and _PLAYBACK_EVIDENCE_RE.search(page_text or ""))
+def playback_goal_is_active(task: str, observation: Observation) -> bool:
+    """Return true only for a foreground app's authoritative active media session."""
+    if not _PLAY_TASK_RE.search(task or ""):
+        return False
+    media = observation.extra.get("media_playback")
+    if not isinstance(media, dict) or str(media.get("state") or "").casefold() != "playing":
+        return False
+    package = str(media.get("package") or "").casefold()
+    foreground = str(observation.foreground_app or "").casefold()
+    return bool(package and foreground and package == foreground)
+
+
+def playback_goal_satisfied(task: str, observation: Observation) -> bool:
+    """Combine strong system playback state with compatible on-screen evidence."""
+    return playback_goal_is_active(task, observation) or bool(
+        _PLAY_TASK_RE.search(task or "")
+        and _PLAYBACK_EVIDENCE_RE.search(observation_text(observation))
+    )
 
 
 def _visual_average_hash(screenshot_path: str | None) -> str:

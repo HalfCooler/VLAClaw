@@ -106,14 +106,15 @@ def test_like_semantics_and_visual_response_parser() -> None:
 def test_inspect_action_is_parsed_as_a_non_tap_coordinate_action() -> None:
     payload = parse_profile_action(
         "general_compact",
-        '{"action_type":"inspect","coordinate":[500,250],'
-        '"memory":{"current":"检查爱心","remaining":"点赞"}}',
+        "Thought: 我要检查爱心状态。\n"
+        'Action: {"action_type":"inspect","coordinate":[500,250]}',
         screen_width=200,
         screen_height=400,
     )
     assert payload["action_type"] == "inspect"
     assert payload["x"] == 100
     assert payload["y"] == 100
+    assert payload["intent"] == "我要检查爱心状态。"
 
 
 def test_target_crop_uses_full_source_and_has_bounded_size(tmp_path: Path) -> None:
@@ -215,10 +216,10 @@ class _LikeLLM:
                 self.actor_image_sizes.append(actor_image.size)
         return LLMResponse(
             content=(
-                '{"action_type":"'
+                "Thought: 我要检查并点击点赞爱心。\n"
+                'Action: {"action_type":"'
                 + self.actor_action
-                + '","coordinate":[500,550],"intent":"检查并点击点赞爱心",'
-                '"memory":{"current":"点赞控件可见","remaining":"点赞"}}'
+                + '","coordinate":[500,550]}'
             ),
             usage={"total_tokens": 5},
         )

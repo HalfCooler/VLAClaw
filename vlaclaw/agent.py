@@ -23,7 +23,13 @@ from vlaclaw.agent_profiles import (
     profile_llm_defaults,
     profile_uses_native_tools,
 )
-from vlaclaw.control import GuardVerdict, TransitionMonitor, build_task_contract, guard_action
+from vlaclaw.control import (
+    GuardVerdict,
+    TransitionMonitor,
+    build_task_contract,
+    guard_action,
+    playback_goal_is_active,
+)
 from vlaclaw.image_utils import scale_image
 from vlaclaw.interfaces import DeviceBackend, LLMProvider, LLMResponse, ProgressCallback, ToolCall
 from vlaclaw.observation import Observation
@@ -175,7 +181,7 @@ class GuiAgent:
         repeat_judge_model: str = "small",
         difficulty_snapshot: dict[str, Any] | None = None,
         planner_model: str = "",
-        planner_max_tokens: int = 96,
+        planner_max_tokens: int | None = None,
     ) -> None:
         self.llm = llm
         self.backend = backend
@@ -198,7 +204,9 @@ class GuiAgent:
         self._trajectory_recorder = trajectory_recorder
         self._planner_llm = planner_llm
         self._planner_model = planner_model
-        self._planner_max_tokens = max(1, int(planner_max_tokens))
+        self._planner_max_tokens = (
+            max(1, int(planner_max_tokens)) if planner_max_tokens is not None else None
+        )
         self._enable_repeat_escalation = bool(enable_repeat_escalation) and planner_llm is not None
         self._repeat_judge_model = canonicalize_repeat_judge_model(repeat_judge_model)
         self._difficulty_snapshot = (
@@ -327,6 +335,25 @@ class GuiAgent:
             task_contract,
             no_progress_limit=self.stagnation_limit or 3,
         )
+        if playback_goal_is_active(task, obs):
+            self._trajectory_recorder.record_event(
+                "playback_goal_verified",
+                phase="initial",
+                media_playback=obs.extra.get("media_playback"),
+            )
+            return AgentResult(
+                success=True,
+                summary=self._build_state_note(
+                    status="completed",
+                    history=[],
+                    current_observation=obs,
+                    current_action_summary="Foreground media is already playing.",
+                ),
+                model_summary="Foreground media is already playing.",
+                trace_path=str(run_dir),
+                steps_taken=0,
+                token_usage=total_usage,
+            )
 
         steps_taken = 0
         for step in range(self.max_steps):
@@ -448,7 +475,7 @@ class GuiAgent:
                     summary=self._build_state_note(
                         status="completed" if success else "blocked",
                         history=history,
-                        current_observation=obs,
+                        current_observation=result.next_observation or obs,
                         current_action_summary=result.state_summary or result.action_summary,
                         error=None if success else result.tool_result,
                     ),
@@ -562,6 +589,7 @@ class GuiAgent:
                 "repeat_judge",
                 "like_preflight",
                 "like_postflight",
+                "playback_verification",
                 "inspection_promoted_to_tap",
                 "executed_action",
             ):
@@ -787,12 +815,14 @@ class GuiAgent:
                 "image_url": {"url": image_path_to_data_url(crop_path)},
             },
         ]
+        verifier_kwargs: dict[str, Any] = {
+            "messages": [{"role": "user", "content": content}],
+            "tools": None,
+        }
+        if self._planner_max_tokens is not None:
+            verifier_kwargs["max_tokens"] = self._planner_max_tokens
         try:
-            response = await verifier.chat(
-                messages=[{"role": "user", "content": content}],
-                tools=None,
-                max_tokens=self._planner_max_tokens,
-            )
+            response = await verifier.chat(**verifier_kwargs)
         except Exception as exc:
             logger.warning("Like-state verifier failed: %s", exc)
             return (
@@ -932,10 +962,11 @@ class GuiAgent:
             }
             if self._reasoning_effort is not None:
                 chat_kwargs["reasoning_effort"] = self._reasoning_effort
-            if escalated:
-                chat_kwargs["max_tokens"] = self._planner_max_tokens
-            elif self._step_max_tokens is not None:
-                chat_kwargs["max_tokens"] = self._step_max_tokens
+            step_max_tokens = (
+                self._planner_max_tokens if escalated else self._step_max_tokens
+            )
+            if step_max_tokens is not None:
+                chat_kwargs["max_tokens"] = step_max_tokens
             active_model = self._planner_model if escalated and self._planner_model else self.model
             inference_started_at = time.time()
             try:
@@ -1323,6 +1354,18 @@ class GuiAgent:
                         "after_state": like_postflight.state,
                         "loop_detected": False,
                     }
+            if next_observation is not None and playback_goal_is_active(task, next_observation):
+                verified_done = True
+                action = replace(action, status="success")
+                result_text = f"{result_text}; verified foreground media playback: playing"
+                playback_snapshot = dict(next_observation.extra.get("media_playback") or {})
+                model_snapshot["playback_verification"] = playback_snapshot
+                self._trajectory_recorder.record_event(
+                    "playback_goal_verified",
+                    step_index=step_index,
+                    phase="post",
+                    media_playback=playback_snapshot,
+                )
             return self._finalize_step_result(
                 StepResult(
                     action=action,

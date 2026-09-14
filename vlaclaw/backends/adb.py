@@ -65,6 +65,21 @@ _FOCUSED_APP_RE = re.compile(
     r"([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z][a-zA-Z0-9_]*)+)/",
     re.IGNORECASE,
 )
+_MEDIA_SESSION_BLOCK_RE = re.compile(r"(?m)^\s*Session\s+#\d+:?\s*$")
+_MEDIA_PACKAGE_RE = re.compile(
+    r"(?:package|packageName|ownerPackageName)\s*[=:]\s*"
+    r"([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)",
+    re.IGNORECASE,
+)
+_MEDIA_COMPONENT_PACKAGE_RE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)/[^\s]+",
+    re.MULTILINE,
+)
+_MEDIA_PLAYBACK_STATE_RE = re.compile(
+    r"(?:PlaybackState\s*\{[^}]*?\bstate|\bplaybackState|\bstate)\s*[=:]\s*"
+    r"(PLAYING|PAUSED|STOPPED|BUFFERING|CONNECTING|NONE|ERROR|\d+)",
+    re.IGNORECASE,
+)
 
 _DEVICE_SCREENSHOT_PATH = "/sdcard/__vlaclaw_cap.png"
 _DEVICE_UI_XML_PATH = "/sdcard/window.xml"
@@ -866,10 +881,11 @@ class AdbBackend:
         snapshot = await self._capture_scrcpy_frame(screenshot_path, timeout=timeout)
         if snapshot is None:
             return await self._observe_via_screencap(screenshot_path, timeout=timeout)
-        (input_width, input_height), fg_app, extra = await asyncio.gather(
+        (input_width, input_height), fg_app, extra, media_sessions = await asyncio.gather(
             self._query_screen_size(timeout),
             self._query_foreground_app(timeout),
             self._collect_ui_tree_extra(timeout, screenshot_path=screenshot_path),
+            self._query_media_sessions(timeout),
         )
         self._capture_width = snapshot.width
         self._capture_height = snapshot.height
@@ -880,6 +896,7 @@ class AdbBackend:
             "frame_timestamp": snapshot.timestamp,
         }
         merged_extra.update(extra)
+        merged_extra.update(_media_playback_extra(media_sessions, fg_app))
         return Observation(
             screenshot_path=str(screenshot_path),
             screen_width=snapshot.width,
@@ -940,16 +957,18 @@ class AdbBackend:
         screenshot_size = read_png_size(screenshot_path)
         ui_tree_task = self._collect_ui_tree_extra(timeout, screenshot_path=screenshot_path)
         if screenshot_size is None:
-            (width, height), fg_app, extra = await asyncio.gather(
+            (width, height), fg_app, extra, media_sessions = await asyncio.gather(
                 self._query_screen_size(timeout),
                 self._query_foreground_app(timeout),
                 ui_tree_task,
+                self._query_media_sessions(timeout),
             )
         else:
             width, height = screenshot_size
-            fg_app, extra = await asyncio.gather(
+            fg_app, extra, media_sessions = await asyncio.gather(
                 self._query_foreground_app(timeout),
                 ui_tree_task,
+                self._query_media_sessions(timeout),
             )
 
         self._screen_width = width
@@ -959,6 +978,7 @@ class AdbBackend:
 
         merged_extra: dict[str, Any] = {"capture_source": "screencap"}
         merged_extra.update(extra)
+        merged_extra.update(_media_playback_extra(media_sessions, fg_app))
         return Observation(
             screenshot_path=str(screenshot_path),
             screen_width=width,
@@ -1062,6 +1082,19 @@ class AdbBackend:
             except (AdbError, TimeoutError):
                 continue
         return "unknown"
+
+    async def _query_media_sessions(self, timeout: float) -> list[dict[str, str]]:
+        """Return Android media-session states without failing screen capture."""
+        try:
+            output = await self._run(
+                "shell",
+                "dumpsys",
+                "media_session",
+                timeout=min(max(timeout, 1.0), 5.0),
+            )
+        except (AdbError, TimeoutError):
+            return []
+        return _parse_media_session_states(output)
 
     @staticmethod
     def _extract_foreground_app(output: str) -> str:
@@ -1686,6 +1719,60 @@ class AdbBackend:
             dur,
             timeout=timeout,
         )
+
+
+def _parse_media_session_states(output: str) -> list[dict[str, str]]:
+    """Parse the compact package/state facts exposed by ``dumpsys media_session``."""
+    blocks = _MEDIA_SESSION_BLOCK_RE.split(str(output or ""))
+    sessions: list[dict[str, str]] = []
+    for block in blocks[1:] if len(blocks) > 1 else blocks:
+        package_match = _MEDIA_PACKAGE_RE.search(block) or _MEDIA_COMPONENT_PACKAGE_RE.search(block)
+        state_match = _MEDIA_PLAYBACK_STATE_RE.search(block)
+        if package_match is None or state_match is None:
+            continue
+        raw_state = state_match.group(1).upper()
+        state = {
+            "0": "none",
+            "1": "stopped",
+            "2": "paused",
+            "3": "playing",
+            "4": "playing",
+            "5": "playing",
+            "6": "buffering",
+            "7": "error",
+            "8": "connecting",
+            "9": "skipping",
+            "10": "skipping",
+            "11": "skipping",
+        }.get(raw_state, raw_state.lower())
+        session = {"package": package_match.group(1), "state": state}
+        if session not in sessions:
+            sessions.append(session)
+    return sessions
+
+
+def _media_playback_extra(
+    sessions: list[dict[str, str]], foreground_app: str | None
+) -> dict[str, Any]:
+    """Expose only the foreground app's session as authoritative playback context."""
+    foreground = str(foreground_app or "").casefold()
+    foreground_session = next(
+        (
+            session
+            for session in sessions
+            if str(session.get("package") or "").casefold() == foreground
+        ),
+        None,
+    )
+    if foreground_session is None:
+        return {}
+    return {
+        "media_playback": {
+            "package": foreground_session["package"],
+            "state": foreground_session["state"],
+            "source": "android_media_session",
+        }
+    }
 
 
 def _parse_ui_tree_xml(

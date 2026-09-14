@@ -9,8 +9,14 @@ from PIL import Image
 
 from vlaclaw.action import Action
 from vlaclaw.agent import GuiAgent
+from vlaclaw.backends.adb import _media_playback_extra, _parse_media_session_states
 from vlaclaw.cli import OpenAICompatibleLLMProvider
-from vlaclaw.control import TransitionMonitor, build_task_contract, guard_action
+from vlaclaw.control import (
+    TransitionMonitor,
+    build_task_contract,
+    guard_action,
+    playback_goal_is_active,
+)
 from vlaclaw.difficulty import route_for_difficulty
 from vlaclaw.interfaces import LLMResponse
 from vlaclaw.observation import Observation
@@ -63,6 +69,45 @@ def test_youku_payment_diversion_replay_is_blocked_and_goal_is_complete() -> Non
     assert verdict.effect == "financial"
     assert verdict.goal_already_satisfied is True
     assert "开通会员" in verdict.target_text
+
+
+def test_android_media_session_exposes_foreground_playback_as_authoritative_context() -> None:
+    output = """
+Sessions Stack - have 2 sessions:
+  Session #0:
+    com.youku.phone/player (userId=0)
+      state=PlaybackState {state=3, position=9812, speed=1.0}
+  Session #1:
+    package=com.spotify.music
+      state=PlaybackState {state=2, position=42, speed=0.0}
+"""
+
+    sessions = _parse_media_session_states(output)
+    extra = _media_playback_extra(sessions, "com.youku.phone")
+
+    assert sessions == [
+        {"package": "com.youku.phone", "state": "playing"},
+        {"package": "com.spotify.music", "state": "paused"},
+    ]
+    assert extra["media_playback"] == {
+        "package": "com.youku.phone",
+        "state": "playing",
+        "source": "android_media_session",
+    }
+
+
+def test_playback_goal_requires_playing_session_to_match_foreground_app() -> None:
+    observation = _observation("已选中第一集", app="com.youku.phone")
+    observation.extra["media_playback"] = {
+        "package": "com.spotify.music",
+        "state": "playing",
+        "source": "android_media_session",
+    }
+
+    assert playback_goal_is_active("播放第一集", observation) is False
+
+    observation.extra["media_playback"]["package"] = "com.youku.phone"
+    assert playback_goal_is_active("播放第一集", observation) is True
 
 
 def test_explicit_purchase_task_authorizes_payment_action() -> None:
@@ -155,14 +200,101 @@ class _FakeBackend:
 
 class _FakeLLM:
     async def chat(self, **kwargs: object) -> LLMResponse:
-        assert kwargs.get("max_tokens") == 48
+        assert "max_tokens" not in kwargs
         return LLMResponse(
             content=(
-                '{"action_type":"click","coordinate":[247,283],'
-                '"memory":{"current":"视频正在试看","remaining":"继续观看"}}'
+                "Thought: 我要点击视频继续观看。\n"
+                'Action: {"action_type":"click","coordinate":[247,283]}'
             ),
             usage={"completion_tokens": 35, "total_tokens": 35},
         )
+
+
+class _PlaybackBackend(_FakeBackend):
+    def __init__(self, *, initially_playing: bool = False) -> None:
+        super().__init__()
+        self.initially_playing = initially_playing
+
+    async def observe(self, screenshot_path: Path, timeout: float = 5.0) -> Observation:
+        del timeout
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (120, 260), "navy").save(screenshot_path)
+        extra: dict[str, object] = {"visible_text": ["第一集", "已选中"]}
+        if self.initially_playing or self.executed:
+            extra["media_playback"] = {
+                "package": "com.youku.phone",
+                "state": "playing",
+                "source": "android_media_session",
+            }
+        return Observation(
+            screenshot_path=str(screenshot_path),
+            screen_width=1200,
+            screen_height=2608,
+            foreground_app="com.youku.phone",
+            platform="android",
+            extra=extra,
+        )
+
+
+class _CountingPlaybackLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, **kwargs: object) -> LLMResponse:
+        del kwargs
+        self.calls += 1
+        return LLMResponse(
+            content=(
+                "Thought: 我要点击第一集开始播放。\n"
+                'Action: {"action_type":"click","coordinate":[300,300]}'
+            )
+        )
+
+
+def test_agent_does_not_click_when_foreground_media_is_already_playing(tmp_path: Path) -> None:
+    backend = _PlaybackBackend(initially_playing=True)
+    llm = _CountingPlaybackLLM()
+    run_root = tmp_path / "already-playing"
+    agent = GuiAgent(
+        llm=llm,
+        backend=backend,
+        trajectory_recorder=TrajectoryRecorder(output_dir=run_root, task="播放第一集"),
+        model="qwen3.5-4b",
+        artifacts_root=run_root,
+        max_steps=4,
+        agent_profile="general_compact",
+    )
+
+    result = asyncio.run(agent.run("播放第一集", max_retries=1))
+
+    assert result.success is True
+    assert result.steps_taken == 0
+    assert llm.calls == 0
+    assert backend.executed == []
+
+
+def test_agent_stops_immediately_after_click_starts_playback(tmp_path: Path) -> None:
+    backend = _PlaybackBackend()
+    llm = _CountingPlaybackLLM()
+    run_root = tmp_path / "starts-playing"
+    agent = GuiAgent(
+        llm=llm,
+        backend=backend,
+        trajectory_recorder=TrajectoryRecorder(output_dir=run_root, task="播放第一集"),
+        model="qwen3.5-4b",
+        artifacts_root=run_root,
+        max_steps=4,
+        agent_profile="general_compact",
+    )
+
+    result = asyncio.run(agent.run("播放第一集", max_retries=1))
+
+    assert result.success is True
+    assert result.steps_taken == 1
+    assert llm.calls == 1
+    assert len(backend.executed) == 1
+    trajectory = json.loads((run_root / "traj.json").read_text(encoding="utf-8"))
+    assert trajectory["steps"][0]["model_output"]["playback_verification"]["state"] == "playing"
 
 
 def test_agent_replay_stops_before_executing_membership_tap(tmp_path: Path) -> None:
@@ -219,11 +351,11 @@ class _SmallUnsafeLLM:
 
     async def chat(self, **kwargs: object) -> LLMResponse:
         self.calls += 1
-        assert kwargs.get("max_tokens") == 48
+        assert "max_tokens" not in kwargs
         return LLMResponse(
             content=(
-                '{"action_type":"click","coordinate":[500,111],'
-                '"memory":{"current":"账户设置","remaining":"查看设置"}}'
+                "Thought: 我要点击账户设置。\n"
+                'Action: {"action_type":"click","coordinate":[500,111]}'
             )
         )
 
@@ -234,11 +366,11 @@ class _LargeRecoveryLLM:
 
     async def chat(self, **kwargs: object) -> LLMResponse:
         self.calls += 1
-        assert kwargs.get("max_tokens") == 96
+        assert "max_tokens" not in kwargs
         return LLMResponse(
             content=(
-                '{"action_type":"status","goal_status":"complete",'
-                '"memory":{"current":"设置已查看","remaining":"无"}}'
+                "Thought: 设置已查看，任务已经完成。\n"
+                'Action: {"action_type":"status","goal_status":"complete"}'
             )
         )
 
@@ -289,15 +421,14 @@ class _FakeCompletions:
         )
 
 
-def test_provider_hard_output_cap_cannot_be_overridden() -> None:
+def test_provider_does_not_force_output_token_cap() -> None:
     provider = OpenAICompatibleLLMProvider(
         base_url="https://example.invalid/v1",
         model="large",
-        hard_max_tokens=96,
     )
     completions = _FakeCompletions()
     provider._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))  # type: ignore[assignment]
 
-    asyncio.run(provider.chat(messages=[{"role": "user", "content": "x"}], max_tokens=256))
+    asyncio.run(provider.chat(messages=[{"role": "user", "content": "x"}]))
 
-    assert completions.kwargs["max_tokens"] == 96
+    assert "max_tokens" not in completions.kwargs

@@ -30,8 +30,6 @@ from vlaclaw.trajectory.recorder import TrajectoryRecorder
 
 logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = Path.home() / ".vlaclaw" / "config.yaml"
-SMALL_MODEL_MAX_TOKENS = 48
-LARGE_MODEL_MAX_TOKENS = 96
 
 
 @dataclass(slots=True)
@@ -80,7 +78,6 @@ class OpenAICompatibleLLMProvider:
         vl_high_resolution_images: bool | None = None,
         reasoning_effort: str | None = None,
         extra_body: dict[str, Any] | None = None,
-        hard_max_tokens: int | None = None,
     ) -> None:
         self._base_url = base_url
         self._model = model
@@ -89,9 +86,6 @@ class OpenAICompatibleLLMProvider:
         self._vl_high_resolution_images = vl_high_resolution_images
         self._reasoning_effort = reasoning_effort
         self._extra_body = dict(extra_body or {})
-        self._hard_max_tokens = (
-            max(1, int(hard_max_tokens)) if hard_max_tokens is not None else None
-        )
         self._client = AsyncOpenAI(api_key=api_key or "no-key", base_url=base_url)
 
     async def chat(
@@ -111,15 +105,8 @@ class OpenAICompatibleLLMProvider:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
-        effective_max_tokens = max_tokens
-        if self._hard_max_tokens is not None:
-            effective_max_tokens = (
-                self._hard_max_tokens
-                if effective_max_tokens is None
-                else min(int(effective_max_tokens), self._hard_max_tokens)
-            )
-        if effective_max_tokens is not None:
-            kwargs["max_tokens"] = effective_max_tokens
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
         if self._top_p is not None:
@@ -179,11 +166,7 @@ class OpenAICompatibleLLMProvider:
         )
 
 
-def build_llm_provider(
-    config: ProviderConfig,
-    *,
-    hard_max_tokens: int | None = None,
-) -> OpenAICompatibleLLMProvider:
+def build_llm_provider(config: ProviderConfig) -> OpenAICompatibleLLMProvider:
     return OpenAICompatibleLLMProvider(
         base_url=config.base_url,
         model=config.model,
@@ -193,7 +176,6 @@ def build_llm_provider(
         vl_high_resolution_images=config.vl_high_resolution_images,
         reasoning_effort=config.reasoning_effort,
         extra_body=config.extra_body,
-        hard_max_tokens=hard_max_tokens,
     )
 
 
@@ -312,10 +294,7 @@ async def _execute_agent(
 ) -> AgentResult:
     run_root = DEFAULT_GUI_RUNS_DIR / datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S_%f")
     large_llm = (
-        build_llm_provider(
-            config.postprocess_provider,
-            hard_max_tokens=LARGE_MODEL_MAX_TOKENS,
-        )
+        build_llm_provider(config.postprocess_provider)
         if config.postprocess_provider is not None
         and (config.enable_repeat_escalation or config.enable_difficulty_routing)
         else None
@@ -365,7 +344,6 @@ async def _execute_agent(
         planner_model=(
             config.postprocess_provider.model if config.postprocess_provider is not None else ""
         ),
-        planner_max_tokens=LARGE_MODEL_MAX_TOKENS,
         image_scale_ratio=config.image_scale_ratio,
         history_image_window=config.history_image_window,
         stagnation_limit=config.stagnation_limit,
@@ -378,7 +356,7 @@ async def run_cli(args: argparse.Namespace) -> AgentResult:
     task = resolve_task(args)
     config = load_config(args.config)
     backend = build_backend(config)
-    provider = build_llm_provider(config.provider, hard_max_tokens=SMALL_MODEL_MAX_TOKENS)
+    provider = build_llm_provider(config.provider)
     return await _execute_agent(args, config, backend, provider, task)
 
 

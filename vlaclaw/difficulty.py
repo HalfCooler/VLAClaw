@@ -190,7 +190,6 @@ async def judge_task_difficulty(llm: Any, task: str) -> DifficultyVerdict:
         response = await llm.chat(
             messages=[{"role": "user", "content": prompt}],
             tools=None,
-            max_tokens=96,
         )
     except Exception as exc:
         logger.warning("Difficulty judge failed; treating as medium: %s", exc)

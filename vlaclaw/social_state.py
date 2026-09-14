@@ -114,8 +114,8 @@ def like_task_policy(task: str) -> str:
         "带斜杠爱心=不感兴趣，绝对禁止点击。看不清时禁止猜测，使用 inspect 并给出该图标中心坐标；"
         "即使看起来已点赞，也必须先 inspect，不能直接声明完成；控制器仅在局部检查确认为空心后执行点赞。"
         "inspect 是本任务额外允许的动作，格式："
-        '{"action_type":"inspect","coordinate":[500,500],"intent":"检查爱心状态",'
-        '"memory":{"current":"检查候选爱心","remaining":"点赞"}}。'
+        'Thought: 我要检查爱心状态。\n'
+        'Action: {"action_type":"inspect","coordinate":[500,500]}。'
     )
 
 

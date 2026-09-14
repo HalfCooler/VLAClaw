@@ -43,7 +43,7 @@ _CLAUDE_IMAGE_SIZE = (1280, 720)
 _CLAUDE_OPUS_MAX_DIMENSION = 1280
 DEFAULT_SCROLL_PIXELS = 400
 _PROFILE_LLM_DEFAULTS: dict[str, dict[str, Any]] = {
-    "general_compact": {"reasoning_effort": "none", "max_tokens": 48},
+    "general_compact": {"reasoning_effort": "none"},
 }
 
 
@@ -110,7 +110,6 @@ def build_profile_messages(
         prompt_template=prompt_template,
         compact_prompt_parts=compact_prompt_parts,
         image_scale_ratio=(image_scale_ratio if profile == "general_compact" else 1.0),
-        rolling_memory_history=(profile == "general_compact"),
     )
 
 
@@ -189,28 +188,13 @@ def parse_profile_action(
     profile = canonicalize_agent_profile(profile_name)
     action_str = _general_e2e_action_text(content)
     summary = content
-    intent = content
     if profile == "general_compact":
+        thought = _general_e2e_thought_text(content)
+        summary = thought or content.strip()
         parsed_action = general_e2e_agent.parse_json_markdown(action_str)
         if isinstance(parsed_action, list) and len(parsed_action) == 1:
             parsed_action = parsed_action[0]
         if isinstance(parsed_action, dict):
-            parsed_intent = parsed_action.get("intent")
-            parsed_memory = parsed_action.get("memory")
-            structured_memory = _general_compact_structured_memory(parsed_action)
-            parsed_result = parsed_action.get("result")
-            if isinstance(parsed_intent, str) and parsed_intent.strip():
-                intent = parsed_intent.strip()
-            if isinstance(parsed_memory, str) and parsed_memory.strip():
-                summary = parsed_memory.strip()
-            elif structured_memory is not None:
-                summary = _general_compact_memory_update_summary(structured_memory)
-            elif isinstance(parsed_result, str) and parsed_result.strip():
-                summary = parsed_result.strip()
-            else:
-                summary = intent
-            if not isinstance(parsed_intent, str) or not parsed_intent.strip():
-                intent = summary
             _reject_compact_scroll_without_direction(parsed_action)
     action = general_e2e_agent.parse_response_to_action(
         action_str,
@@ -218,10 +202,7 @@ def parse_profile_action(
         screen_height,
         scale_factor=_general_e2e_scale_factor(model_name, screen_width, screen_height),
     )
-    payload = _to_guiclaw_payload(action, summary=summary)
-    if profile == "general_compact":
-        payload["intent"] = intent
-    return payload
+    return _to_guiclaw_payload(action, summary=summary)
 
 
 def _build_general_e2e_messages(
@@ -234,7 +215,6 @@ def _build_general_e2e_messages(
     prompt_template: Any,
     compact_prompt_parts: Any | None = None,
     image_scale_ratio: float = 1.0,
-    rolling_memory_history: bool = False,
 ) -> list[dict[str, Any]]:
     task_policy = like_task_policy(task)
     task_instruction = f"{task}\n\n{task_policy}" if task_policy else task
@@ -260,22 +240,6 @@ def _build_general_e2e_messages(
             or "",
         ),
     }
-    if rolling_memory_history:
-        latest_memory = _general_compact_history_memory(history)
-        instruction_parts = [f"Instruction: {task_instruction}"]
-        if latest_memory:
-            instruction_parts.extend(["", f"Memory state:\n{latest_memory}"])
-        return [
-            system_message,
-            _general_user_message(
-                current_observation,
-                tool_result=None,
-                instruction="\n".join(instruction_parts),
-                model_name=model_name,
-                image_scale_ratio=image_scale_ratio,
-            ),
-        ]
-
     responses = [_history_raw_response(turn) for turn in history]
     messages = [
         system_message,
@@ -325,133 +289,6 @@ def _reject_compact_scroll_without_direction(parsed_action: dict[str, Any]) -> N
     direction = str(raw_direction).strip().lower() if raw_direction is not None else ""
     if direction not in _COMPACT_SCROLL_DIRECTIONS:
         raise ValueError("scroll requires direction: up, down, left, or right")
-
-
-def _general_compact_memory_items(value: Any) -> list[str]:
-    values = value if isinstance(value, list) else [value]
-    return [str(item).strip() for item in values if isinstance(item, str) and item.strip()]
-
-
-def _general_compact_structured_memory(parsed: Any) -> dict[str, Any] | None:
-    if not isinstance(parsed, dict):
-        return None
-    nested = parsed.get("memory")
-    if isinstance(nested, dict):
-        return nested
-    flat = {key: parsed[key] for key in ("add", "drop", "current", "remaining") if key in parsed}
-    return flat or None
-
-
-def _general_compact_memory_update_summary(memory: dict[str, Any]) -> str:
-    parts: list[str] = []
-    additions = _general_compact_memory_items(memory.get("add"))
-    removals = _general_compact_memory_items(memory.get("drop"))
-    current = memory.get("current")
-    remaining = memory.get("remaining")
-    if additions:
-        parts.append(f"新增锁定：{'；'.join(additions)}")
-    if removals and additions:
-        parts.append(f"修正锁定：{'；'.join(removals)}")
-    if isinstance(current, str) and current.strip():
-        parts.append(f"当前：{current.strip()}")
-    if isinstance(remaining, str) and remaining.strip():
-        parts.append(f"剩余/约束：{remaining.strip()}")
-    return "；".join(parts) or "Memory 未提供有效更新"
-
-
-def _general_compact_legacy_fields(memory: str) -> tuple[list[str], str, str]:
-    text = memory.strip()
-    completed_prefix = "已完成/事实："
-    current_marker = "；当前："
-    remaining_marker = "；剩余/约束："
-    if text.startswith(completed_prefix) and current_marker in text:
-        completed, _, tail = text[len(completed_prefix) :].partition(current_marker)
-        current, separator, remaining = tail.partition(remaining_marker)
-        locked = [] if completed.strip() in {"", "无", "暂无"} else [completed.strip()]
-        return locked, current.strip(), remaining.strip() if separator else ""
-    return ([text] if text else []), "", ""
-
-
-def _general_compact_history_memory(history: list[Any]) -> str:
-    locked: list[str] = []
-    current = ""
-    remaining = ""
-
-    def append_locked(items: list[str]) -> None:
-        known = {" ".join(item.split()) for item in locked}
-        for item in items:
-            normalized = " ".join(item.split())
-            if normalized and normalized not in known:
-                locked.append(item)
-                known.add(normalized)
-
-    def merge_legacy(text: str) -> None:
-        nonlocal current, remaining
-        additions, legacy_current, legacy_remaining = _general_compact_legacy_fields(text)
-        append_locked(additions)
-        if legacy_current:
-            current = legacy_current
-        if legacy_remaining:
-            remaining = legacy_remaining
-
-    for turn in history:
-        raw = _history_raw_response(turn).strip()
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-        if isinstance(parsed, list) and len(parsed) == 1:
-            parsed = parsed[0]
-
-        parsed_memory = parsed.get("memory") if isinstance(parsed, dict) else None
-        structured_memory = _general_compact_structured_memory(parsed)
-        if structured_memory is not None:
-            additions = _general_compact_memory_items(structured_memory.get("add"))
-            removals = _general_compact_memory_items(structured_memory.get("drop"))
-            if additions and removals:
-                removal_keys = {" ".join(item.split()) for item in removals}
-                locked[:] = [
-                    item for item in locked if " ".join(item.split()) not in removal_keys
-                ]
-            append_locked(additions)
-            new_current = structured_memory.get("current")
-            new_remaining = structured_memory.get("remaining")
-            if isinstance(new_current, str) and new_current.strip():
-                current = new_current.strip()
-            if isinstance(new_remaining, str) and new_remaining.strip():
-                remaining = new_remaining.strip()
-            continue
-
-        legacy = ""
-        if isinstance(parsed_memory, str) and parsed_memory.strip():
-            legacy = parsed_memory.strip()
-        elif isinstance(parsed, dict):
-            parsed_result = parsed.get("result")
-            if isinstance(parsed_result, str) and parsed_result.strip():
-                legacy = parsed_result.strip()
-        if not legacy:
-            stored_result = str(getattr(turn, "state_summary", "") or "").strip()
-            if stored_result and not stored_result.startswith(("{", "[")):
-                legacy = stored_result
-        if not legacy and isinstance(parsed, dict):
-            parsed_intent = parsed.get("intent")
-            if isinstance(parsed_intent, str) and parsed_intent.strip():
-                legacy = parsed_intent.strip()
-        if not legacy:
-            stored_intent = str(getattr(turn, "action_intent", "") or "").strip()
-            if stored_intent and not stored_intent.startswith(("{", "[")):
-                legacy = stored_intent
-        if legacy:
-            merge_legacy(legacy)
-
-    if not locked and not current and not remaining:
-        return ""
-    locked_text = "\n".join(f"- {item}" for item in locked) if locked else "- 无"
-    return (
-        f"已确认/锁定：\n{locked_text}\n"
-        f"当前：{current or '未知'}\n"
-        f"剩余：{remaining or '未知'}"
-    )
 
 
 def _general_user_message(
@@ -558,6 +395,16 @@ def _general_e2e_action_text(content: str) -> str:
             action["coordinate"] = action.pop("target")
         return json.dumps(action, ensure_ascii=False)
     return action_str
+
+
+def _general_e2e_thought_text(content: str) -> str:
+    if "Action:" not in content:
+        return ""
+    try:
+        thought, _action_str = general_e2e_agent.parse_action(content)
+    except ValueError:
+        return ""
+    return thought.strip()
 
 
 def _hide_history_images_like_general(
