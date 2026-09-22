@@ -24,10 +24,7 @@ from vlaclaw.agent_profiles import (
     profile_uses_native_tools,
 )
 from vlaclaw.control import (
-    GuardVerdict,
     TransitionMonitor,
-    build_task_contract,
-    guard_action,
     playback_goal_is_active,
 )
 from vlaclaw.image_utils import scale_image
@@ -44,21 +41,6 @@ from vlaclaw.planner_escalation import (
     parse_repeat_verdict,
     should_judge_repeat,
     ui_tree_difference_ratio,
-)
-from vlaclaw.social_state import (
-    LIKE_LIKED,
-    LIKE_NOT_INTERESTED,
-    LIKE_OTHER,
-    LIKE_UNLIKED,
-    LIKE_UNKNOWN,
-    LikeStateVerdict,
-    action_likely_targets_like,
-    build_like_verifier_prompt,
-    crop_action_target,
-    image_path_to_data_url,
-    infer_like_state_from_semantics,
-    parse_like_state_verdict,
-    task_requests_like_on,
 )
 from vlaclaw.trajectory.recorder import ExecutionPhase, TrajectoryRecorder
 from vlaclaw.trajectory.summarizer import build_state_note
@@ -95,7 +77,6 @@ class StepResult:
     next_observation: Observation | None = None
     prompt_snapshot: dict[str, Any] | None = None
     model_snapshot: dict[str, Any] | None = None
-    guard_snapshot: dict[str, Any] | None = None
     transition_snapshot: dict[str, Any] | None = None
     action_executed: bool = True
     done: bool = False
@@ -176,6 +157,7 @@ class GuiAgent:
         image_scale_ratio: float = 0.5,
         stagnation_limit: int = 0,
         reasoning_effort: str | None = None,
+        actor_role: str = "small",
         planner_llm: LLMProvider | None = None,
         enable_repeat_escalation: bool = True,
         repeat_judge_model: str = "small",
@@ -202,6 +184,7 @@ class GuiAgent:
         )
         self.progress_callback = progress_callback
         self._trajectory_recorder = trajectory_recorder
+        self._actor_role = "large" if actor_role == "large" else "small"
         self._planner_llm = planner_llm
         self._planner_model = planner_model
         self._planner_max_tokens = (
@@ -329,10 +312,9 @@ class GuiAgent:
         total_usage: dict[str, int] = {}
         previous_action: Action | None = None
         previous_observation: Observation | None = None
-        task_contract = build_task_contract(task)
         transition_monitor = TransitionMonitor(
             obs,
-            task_contract,
+            task,
             no_progress_limit=self.stagnation_limit or 3,
         )
         if playback_goal_is_active(task, obs):
@@ -392,14 +374,7 @@ class GuiAgent:
             for key, value in result.step_usage.items():
                 total_usage[key] = total_usage.get(key, 0) + value
 
-            if result.guard_snapshot is not None:
-                self._trajectory_recorder.record_event(
-                    "action_guard",
-                    step_index=step_index,
-                    action=describe_action(result.action),
-                    **result.guard_snapshot,
-                )
-            elif (
+            if (
                 result.transition_snapshot is None
                 and result.next_observation is not None
                 and not result.done
@@ -441,32 +416,6 @@ class GuiAgent:
                 current_observation=obs,
                 result=result,
             )
-
-            if result.guard_snapshot and not result.guard_snapshot.get("allowed", True):
-                goal_satisfied = bool(result.guard_snapshot.get("goal_already_satisfied"))
-                reason = str(result.guard_snapshot.get("reason") or "unsafe_action_blocked")
-                history_with_current_step = history + [
-                    self._history_turn_from_step(step_index, obs, result)
-                ]
-                return AgentResult(
-                    success=goal_satisfied,
-                    summary=self._build_state_note(
-                        status="completed" if goal_satisfied else "blocked",
-                        history=history_with_current_step,
-                        current_observation=obs,
-                        current_action_summary=(
-                            "Goal already satisfied; blocked an unrelated risky action."
-                            if goal_satisfied
-                            else f"Blocked unsafe action: {reason}"
-                        ),
-                        error=None if goal_satisfied else "unsafe_action_blocked",
-                    ),
-                    model_summary=result.state_summary or result.action_summary,
-                    trace_path=str(run_dir),
-                    steps_taken=steps_taken,
-                    error=None if goal_satisfied else f"unsafe_action_blocked: {reason}",
-                    token_usage=total_usage,
-                )
 
             if result.done:
                 success = self._resolve_done_status(result.action) == "success"
@@ -598,8 +547,6 @@ class GuiAgent:
         else:
             model_output = result.action_intent or result.action_summary or ""
         if isinstance(model_output, dict):
-            if result.guard_snapshot is not None:
-                model_output["guard"] = result.guard_snapshot
             if result.transition_snapshot is not None:
                 model_output["transition"] = result.transition_snapshot
             model_output["action_executed"] = result.action_executed
@@ -663,6 +610,11 @@ class GuiAgent:
             return self._planner_llm
         return self.llm
 
+    def _repeat_judge_role(self) -> str:
+        if self._repeat_judge_model == "large" and self._planner_llm is not None:
+            return "large"
+        return self._actor_role
+
     async def _repeat_replan_decision(
         self,
         *,
@@ -702,7 +654,7 @@ class GuiAgent:
         for key, value in judge_usage.items():
             step_usage[key] = step_usage.get(key, 0) + value
         snapshot = {
-            "judge_model": self._repeat_judge_model,
+            "judge_model": self._repeat_judge_role(),
             "previous_action_type": previous_action.action_type,
             "proposed_action_type": proposed_action.action_type,
             "ui_tree_difference": ui_tree_difference_ratio(previous_tree, current_tree),
@@ -770,7 +722,7 @@ class GuiAgent:
     def _like_verifier_llm(self) -> tuple[LLMProvider, str]:
         if self._planner_llm is not None:
             return self._planner_llm, "large"
-        return self.llm, "small"
+        return self.llm, self._actor_role
 
     async def _inspect_like_state(
         self,
@@ -851,60 +803,6 @@ class GuiAgent:
         )
 
     @staticmethod
-    def _like_guard_verdict(
-        action: Action,
-        like_state: LikeStateVerdict,
-        *,
-        likely_like_target: bool,
-        target_text: str,
-        target_node: dict[str, Any] | None,
-    ) -> GuardVerdict | None:
-        if like_state.state == LIKE_LIKED:
-            if action.action_type != "inspect" and not likely_like_target:
-                return GuardVerdict(
-                    False,
-                    "filled_heart_requires_explicit_like_inspection",
-                    effect="like_on",
-                    target_text=target_text,
-                    target_node=target_node,
-                )
-            return GuardVerdict(
-                False,
-                "like_already_on",
-                effect="like_on",
-                target_text=target_text,
-                target_node=target_node,
-                goal_already_satisfied=True,
-            )
-        if like_state.state == LIKE_NOT_INTERESTED:
-            return GuardVerdict(
-                False,
-                "not_interested_is_not_like",
-                effect="not_interested",
-                target_text=target_text,
-                target_node=target_node,
-            )
-        if action.action_type == "inspect" and like_state.state != LIKE_UNLIKED:
-            return GuardVerdict(
-                False,
-                f"like_inspection_{like_state.state}",
-                effect="like_on",
-                target_text=target_text,
-                target_node=target_node,
-            )
-        if like_state.state == LIKE_UNKNOWN or (
-            likely_like_target and like_state.state == LIKE_OTHER
-        ):
-            return GuardVerdict(
-                False,
-                f"like_target_{like_state.state}",
-                effect="like_on",
-                target_text=target_text,
-                target_node=target_node,
-            )
-        return None
-
-    @staticmethod
     def _append_like_crop(messages: list[dict[str, Any]], verdict: LikeStateVerdict) -> None:
         crop_path = Path(verdict.crop_path or "")
         if not crop_path.is_file() or not messages:
@@ -976,7 +874,7 @@ class GuiAgent:
                 step_chat_latency_s += call_duration_s
             model_calls.append(
                 {
-                    "actor": "large" if escalated else "small",
+                    "actor": "large" if escalated else self._actor_role,
                     "model": active_model,
                     "trigger": escalation_trigger or "step",
                     "token_usage": dict(response.usage or {}),
@@ -1105,37 +1003,29 @@ class GuiAgent:
             if escalated and escalation_trigger:
                 model_snapshot["trigger"] = escalation_trigger
 
-            completion_guard: GuardVerdict | None = None
             if action.action_type == "done":
                 done_status = self._resolve_done_status(action)
                 if action.status != done_status:
                     action = replace(action, status=done_status)
-                if done_status == "success" and task_requests_like_on(task):
-                    completion_guard = GuardVerdict(
-                        False,
-                        "like_completion_requires_local_inspection",
-                        effect="like_on",
-                    )
-                else:
-                    tool_result = f"Task terminated with status: {done_status}"
-                    return self._finalize_step_result(
-                        StepResult(
-                            action=action,
-                            tool_call_id=tool_call.id,
-                            tool_result=tool_result,
-                            assistant_message=assistant_message,
-                            action_summary=action_summary,
-                            action_intent=action_summary,
-                            state_summary=state_summary,
-                            model_snapshot=model_snapshot,
-                            action_executed=False,
-                            done=True,
-                        ),
-                        step_usage=step_usage,
-                        step_start=step_start,
-                        step_chat_latency_s=step_chat_latency_s,
-                        step_ttft_s=step_ttft_s,
-                    )
+                tool_result = f"Task terminated with status: {done_status}"
+                return self._finalize_step_result(
+                    StepResult(
+                        action=action,
+                        tool_call_id=tool_call.id,
+                        tool_result=tool_result,
+                        assistant_message=assistant_message,
+                        action_summary=action_summary,
+                        action_intent=action_summary,
+                        state_summary=state_summary,
+                        model_snapshot=model_snapshot,
+                        action_executed=False,
+                        done=True,
+                    ),
+                    step_usage=step_usage,
+                    step_start=step_start,
+                    step_chat_latency_s=step_chat_latency_s,
+                    step_ttft_s=step_ttft_s,
+                )
 
             if action.action_type == "request_intervention":
                 return self._finalize_step_result(
@@ -1157,136 +1047,7 @@ class GuiAgent:
                     step_ttft_s=step_ttft_s,
                 )
 
-            task_contract = build_task_contract(task)
-            guard = completion_guard or guard_action(action, current_observation, task_contract)
-            like_preflight: LikeStateVerdict | None = None
-            if (
-                guard.allowed
-                and task_requests_like_on(task)
-                and action.action_type in {"tap", "inspect"}
-            ):
-                like_preflight, like_usage = await self._inspect_like_state(
-                    observation=current_observation,
-                    action=action,
-                    target_text=guard.target_text,
-                    target_node=guard.target_node,
-                    step_index=step_index,
-                    phase="pre",
-                )
-                for key, value in like_usage.items():
-                    step_usage[key] = step_usage.get(key, 0) + value
-                like_snapshot = {
-                    **like_preflight.snapshot(),
-                    "phase": "pre",
-                    "token_usage": like_usage,
-                }
-                model_snapshot["like_preflight"] = like_snapshot
-                self._trajectory_recorder.record_event(
-                    "like_state_verification",
-                    step_index=step_index,
-                    **like_snapshot,
-                )
-                explicit_intent = ""
-                if re.search(r'["\']intent["\']\s*:', response.content or ""):
-                    explicit_intent = self._clean_action_summary(
-                        (tool_call.arguments or {}).get("intent")
-                    ) or ""
-                likely_like_target = action_likely_targets_like(
-                    action,
-                    explicit_intent=explicit_intent,
-                    target_text=guard.target_text,
-                    target_node=guard.target_node,
-                )
-                visual_guard = self._like_guard_verdict(
-                    action,
-                    like_preflight,
-                    likely_like_target=likely_like_target,
-                    target_text=guard.target_text,
-                    target_node=guard.target_node,
-                )
-                if visual_guard is not None:
-                    guard = visual_guard
-            if not guard.allowed:
-                guard_snapshot = guard.snapshot()
-                model_snapshot["guard"] = guard_snapshot
-                if (
-                    not guard.goal_already_satisfied
-                    and not escalated
-                    and self._planner_llm is not None
-                ):
-                    self._trajectory_recorder.record_event(
-                        "planner_escalation",
-                        step_index=step_index,
-                        trigger="action_guard",
-                        actor="small",
-                        model=self.model,
-                        proposed_action=self._serialize_action(action),
-                        guard=guard_snapshot,
-                        token_usage=dict(response.usage or {}),
-                    )
-                    messages[:] = inject_repeat_escalation_hint(
-                        original_messages,
-                        (
-                            "Controller feedback: the small model's proposed action was rejected "
-                            f"before execution ({guard.reason}). Re-ground on the current screen "
-                            "and choose one different action that stays strictly within the "
-                            "original task. Do not perform payment, authentication, deletion, "
-                            "publishing, or social-state changes unless the original task "
-                            "explicitly requests that effect."
-                        ),
-                    )
-                    if like_preflight is not None:
-                        self._append_like_crop(messages, like_preflight)
-                    actor = self._planner_llm
-                    escalated = True
-                    escalation_trigger = "action_guard"
-                    retries_left = self._MAX_TOOL_RETRIES + 1
-                    continue
-                return self._finalize_step_result(
-                    StepResult(
-                        action=action,
-                        tool_call_id=tool_call.id,
-                        tool_result=f"Action blocked by controller: {guard.reason}",
-                        assistant_message=assistant_message,
-                        action_summary=action_summary,
-                        action_intent=action_summary,
-                        state_summary=state_summary,
-                        next_observation=current_observation,
-                        model_snapshot=model_snapshot,
-                        guard_snapshot=guard_snapshot,
-                        action_executed=False,
-                    ),
-                    step_usage=step_usage,
-                    step_start=step_start,
-                    step_chat_latency_s=step_chat_latency_s,
-                    step_ttft_s=step_ttft_s,
-                )
-
             if action.action_type == "inspect":
-                if like_preflight is None:
-                    unsupported_guard = GuardVerdict(
-                        False,
-                        "inspect_is_only_available_for_like_state_verification",
-                    )
-                    return self._finalize_step_result(
-                        StepResult(
-                            action=action,
-                            tool_call_id=tool_call.id,
-                            tool_result=f"Action blocked by controller: {unsupported_guard.reason}",
-                            assistant_message=assistant_message,
-                            action_summary=action_summary,
-                            action_intent=action_intent or action_summary,
-                            state_summary=state_summary,
-                            next_observation=current_observation,
-                            model_snapshot=model_snapshot,
-                            guard_snapshot=unsupported_guard.snapshot(),
-                            action_executed=False,
-                        ),
-                        step_usage=step_usage,
-                        step_start=step_start,
-                        step_chat_latency_s=step_chat_latency_s,
-                        step_ttft_s=step_ttft_s,
-                    )
                 action = replace(action, action_type="tap")
                 model_snapshot["inspection_promoted_to_tap"] = True
                 model_snapshot["executed_action"] = self._serialize_action(action)
@@ -1310,50 +1071,7 @@ class GuiAgent:
             )
             transition_snapshot: dict[str, Any] | None = None
             verified_done = False
-            if like_preflight is not None and like_preflight.state == LIKE_UNLIKED:
-                if next_observation is None:
-                    like_postflight = LikeStateVerdict(
-                        LIKE_UNKNOWN,
-                        0.0,
-                        "post-action observation unavailable",
-                        source="controller",
-                    )
-                    like_usage = {}
-                else:
-                    post_target = guard_action(action, next_observation, task_contract)
-                    like_postflight, like_usage = await self._inspect_like_state(
-                        observation=next_observation,
-                        action=action,
-                        target_text=post_target.target_text,
-                        target_node=post_target.target_node,
-                        step_index=step_index,
-                        phase="post",
-                    )
-                for key, value in like_usage.items():
-                    step_usage[key] = step_usage.get(key, 0) + value
-                post_snapshot = {
-                    **like_postflight.snapshot(),
-                    "phase": "post",
-                    "token_usage": like_usage,
-                }
-                model_snapshot["like_postflight"] = post_snapshot
-                self._trajectory_recorder.record_event(
-                    "like_state_verification",
-                    step_index=step_index,
-                    **post_snapshot,
-                )
-                if like_postflight.state == LIKE_LIKED:
-                    verified_done = True
-                    action = replace(action, status="success")
-                    result_text = f"{result_text}; verified like state: liked"
-                else:
-                    transition_snapshot = {
-                        "status": "goal_verification_failed",
-                        "reason": f"expected_liked_after_tap_got_{like_postflight.state}",
-                        "before_state": LIKE_UNLIKED,
-                        "after_state": like_postflight.state,
-                        "loop_detected": False,
-                    }
+
             if next_observation is not None and playback_goal_is_active(task, next_observation):
                 verified_done = True
                 action = replace(action, status="success")

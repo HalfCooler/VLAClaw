@@ -13,8 +13,6 @@ from vlaclaw.backends.adb import _media_playback_extra, _parse_media_session_sta
 from vlaclaw.cli import OpenAICompatibleLLMProvider
 from vlaclaw.control import (
     TransitionMonitor,
-    build_task_contract,
-    guard_action,
     playback_goal_is_active,
 )
 from vlaclaw.difficulty import route_for_difficulty
@@ -53,22 +51,6 @@ def _observation(label: str, app: str = "example.app") -> Observation:
         platform="android",
         extra={"visible_text": [label]},
     )
-
-
-def test_youku_payment_diversion_replay_is_blocked_and_goal_is_complete() -> None:
-    observation = _youku_playback_observation()
-    action = Action(action_type="tap", x=296, y=738)
-
-    verdict = guard_action(
-        action,
-        observation,
-        build_task_contract("继续观看优酷视频历史记录里的第一个视频。"),
-    )
-
-    assert verdict.allowed is False
-    assert verdict.effect == "financial"
-    assert verdict.goal_already_satisfied is True
-    assert "开通会员" in verdict.target_text
 
 
 def test_android_media_session_exposes_foreground_playback_as_authoritative_context() -> None:
@@ -110,42 +92,10 @@ def test_playback_goal_requires_playing_session_to_match_foreground_app() -> Non
     assert playback_goal_is_active("播放第一集", observation) is True
 
 
-def test_explicit_purchase_task_authorizes_payment_action() -> None:
-    observation = _youku_playback_observation()
-    verdict = guard_action(
-        Action(action_type="tap", x=296, y=738),
-        observation,
-        build_task_contract("购买优酷会员并付款"),
-    )
-    assert verdict.allowed is True
-    assert verdict.effect == "financial"
-
-
-def test_payment_authorization_does_not_authorize_password_entry() -> None:
-    observation = Observation(
-        screenshot_path=None,
-        screen_width=1080,
-        screen_height=1920,
-        foreground_app="com.youku.phone",
-        extra={
-            "ui_tree": [
-                {"text": "输入支付密码", "bounds": "[100,100][900,300]", "enabled": True}
-            ]
-        },
-    )
-    verdict = guard_action(
-        Action(action_type="tap", x=500, y=200),
-        observation,
-        build_task_contract("购买优酷会员并付款"),
-    )
-    assert verdict.allowed is False
-    assert verdict.effect == "authentication"
-
-
 def test_transition_monitor_detects_alternating_action_cycle() -> None:
     first = _observation("A")
     second = _observation("B")
-    monitor = TransitionMonitor(first, build_task_contract("打开示例页面"))
+    monitor = TransitionMonitor(first, "打开示例页面")
 
     assert monitor.evaluate(first, Action(action_type="tap", x=1, y=1), second).status == "progress"
     assert monitor.evaluate(second, Action(action_type="wait"), first).status == "progress"
@@ -159,7 +109,7 @@ def test_transition_monitor_detects_alternating_action_cycle() -> None:
 def test_transition_monitor_rejects_off_task_payment_app() -> None:
     before = _observation("video", app="com.youku.phone")
     after = _observation("输入密码", app="com.eg.android.AlipayGphone")
-    monitor = TransitionMonitor(before, build_task_contract("继续观看视频"))
+    monitor = TransitionMonitor(before, "继续观看视频")
 
     verdict = monitor.evaluate(before, Action(action_type="tap", x=10, y=10), after)
 
@@ -297,7 +247,7 @@ def test_agent_stops_immediately_after_click_starts_playback(tmp_path: Path) -> 
     assert trajectory["steps"][0]["model_output"]["playback_verification"]["state"] == "playing"
 
 
-def test_agent_replay_stops_before_executing_membership_tap(tmp_path: Path) -> None:
+def test_agent_executes_model_tap_without_pre_execution_gate(tmp_path: Path) -> None:
     backend = _FakeBackend()
     run_root = tmp_path / "run"
     recorder = TrajectoryRecorder(output_dir=run_root, task="继续观看优酷视频历史记录里的第一个视频")
@@ -315,15 +265,12 @@ def test_agent_replay_stops_before_executing_membership_tap(tmp_path: Path) -> N
         agent.run("继续观看优酷视频历史记录里的第一个视频", max_retries=1)
     )
 
-    assert result.success is True
-    assert backend.executed == []
+    assert result.success is False
+    assert backend.executed
     trajectory = json.loads((run_root / "traj.json").read_text(encoding="utf-8"))
-    assert trajectory["steps"][0]["model_output"]["action_executed"] is False
+    assert trajectory["steps"][0]["model_output"]["action_executed"] is True
     assert trajectory["steps"][0]["model_output"]["actor"] == "small"
-    assert trajectory["steps"][0]["model_output"]["guard"]["effect"] == "financial"
-    assert any(event["type"] == "action_guard" for event in trajectory["events"])
-    normalized_events = load_trajectory_events(run_root / "traj.json")
-    assert any(event["type"] == "action_guard" for event in normalized_events)
+    assert load_trajectory_events(run_root / "traj.json")
 
 
 class _GuardRecoveryBackend(_FakeBackend):
@@ -375,7 +322,7 @@ class _LargeRecoveryLLM:
         )
 
 
-def test_guard_failure_gets_one_bounded_large_model_recovery(tmp_path: Path) -> None:
+def test_model_tap_does_not_trigger_guard_recovery(tmp_path: Path) -> None:
     small = _SmallUnsafeLLM()
     large = _LargeRecoveryLLM()
     backend = _GuardRecoveryBackend()
@@ -394,18 +341,17 @@ def test_guard_failure_gets_one_bounded_large_model_recovery(tmp_path: Path) -> 
 
     result = asyncio.run(agent.run("查看账户设置", max_retries=1))
 
-    assert result.success is True
-    assert small.calls == 1
-    assert large.calls == 1
-    assert backend.executed == []
+    assert result.success is False
+    assert small.calls >= 1
+    assert large.calls == 0
+    assert backend.executed
     trajectory = json.loads((run_root / "traj.json").read_text(encoding="utf-8"))
     model_output = trajectory["steps"][0]["model_output"]
-    assert model_output["actor"] == "large"
-    assert model_output["model"] == "qwen3.8-flash"
-    assert model_output["trigger"] == "action_guard"
-    assert [call["actor"] for call in model_output["model_calls"]] == ["small", "large"]
+    assert model_output["actor"] == "small"
+    assert model_output["model"] == "qwen3.5-4b"
+    assert [call["actor"] for call in model_output["model_calls"]] == ["small"]
     escalations = [event for event in trajectory["events"] if event["type"] == "planner_escalation"]
-    assert escalations[-1]["trigger"] == "action_guard"
+    assert not escalations
 
 
 class _FakeCompletions:

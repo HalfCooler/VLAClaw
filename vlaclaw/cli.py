@@ -55,6 +55,7 @@ class AdbConfig:
 class CliConfig:
     provider: ProviderConfig
     postprocess_provider: ProviderConfig | None = None
+    large_model_test: bool = False
     adb: AdbConfig = field(default_factory=AdbConfig)
     max_steps: int = 15
     stagnation_limit: int = 0
@@ -239,6 +240,7 @@ def load_config(path: Path | None = None) -> CliConfig:
     return CliConfig(
         provider=provider,
         postprocess_provider=postprocess_provider,
+        large_model_test=_coerce_bool(raw.get("large_model_test"), default=False),
         adb=AdbConfig(
             serial=_optional_string(adb_raw, "serial"),
             adb_path=_optional_string(adb_raw, "adb_path") or "adb",
@@ -293,10 +295,18 @@ async def _execute_agent(
     task: str,
 ) -> AgentResult:
     run_root = DEFAULT_GUI_RUNS_DIR / datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S_%f")
+    if config.large_model_test and config.postprocess_provider is None:
+        raise ValueError(
+            "large_model_test requires postprocess_provider to configure the large model"
+        )
     large_llm = (
         build_llm_provider(config.postprocess_provider)
         if config.postprocess_provider is not None
-        and (config.enable_repeat_escalation or config.enable_difficulty_routing)
+        and (
+            config.large_model_test
+            or config.enable_repeat_escalation
+            or config.enable_difficulty_routing
+        )
         else None
     )
     explicit_profile = args.agent_profile or config.agent_profile
@@ -306,7 +316,24 @@ async def _execute_agent(
         large_llm=large_llm,
         explicit_profile=explicit_profile,
     )
-    if difficulty_route is not None:
+    if config.large_model_test:
+        # Keep the existing agent loop, profiles, and recovery behavior, but
+        # replace every normal actor step with the configured large model.
+        assert large_llm is not None
+        assert config.postprocess_provider is not None
+        actor_llm = large_llm
+        actor_model = config.postprocess_provider.model
+        agent_profile = (
+            difficulty_route.agent_profile
+            if difficulty_route is not None
+            else explicit_profile or config.agent_profile
+        )
+        difficulty_snapshot = difficulty_route.snapshot() if difficulty_route is not None else None
+        if difficulty_snapshot is not None:
+            difficulty_snapshot["actor"] = "large"
+            difficulty_snapshot["large_model_test"] = True
+        actor_reasoning_effort = config.postprocess_provider.reasoning_effort
+    elif difficulty_route is not None:
         actor_llm = (large_llm or provider) if difficulty_route.use_large_model else provider
         actor_model = (
             config.postprocess_provider.model
@@ -348,6 +375,7 @@ async def _execute_agent(
         history_image_window=config.history_image_window,
         stagnation_limit=config.stagnation_limit,
         reasoning_effort=actor_reasoning_effort,
+        actor_role="large" if config.large_model_test else "small",
     )
     return await agent.run(task)
 

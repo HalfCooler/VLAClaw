@@ -1,16 +1,9 @@
-"""Deterministic safety and progress control for GUI actions.
-
-The model proposes an action; this module decides whether the action may be
-executed and whether the resulting transition made progress.  These checks are
-deliberately model-free so that recovery does not depend on the same visual
-reasoning failure that produced a bad action.
-"""
+"""Post-action progress control for GUI actions."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -19,89 +12,8 @@ from typing import Any
 
 from PIL import Image
 
-from vlaclaw.action import Action, resolve_coordinate
+from vlaclaw.action import Action
 from vlaclaw.observation import Observation
-from vlaclaw.social_state import task_requests_like_off, task_requests_like_on
-
-_BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
-
-_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "authentication",
-        re.compile(
-            r"输入密码|支付密码|人脸|面容|指纹|验证码|身份验证|"
-            r"password|face\s*(?:id|verify)|fingerprint|verification code",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "financial",
-        re.compile(
-            r"付款|支付|确认付款|立即购买|购买|下单|提交订单|充值|转账|红包|"
-            r"开通会员|续费|订阅|内购|pay\b|purchase|subscribe|checkout",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "destructive",
-        re.compile(
-            r"永久删除|删除账户|注销账户|清空|恢复出厂|格式化|卸载|"
-            r"permanently delete|delete account|factory reset|format|uninstall",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "external_write",
-        re.compile(
-            r"发送|发表|发布|评论|回复|提交表单|send\b|post\b|publish|comment|reply",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "not_interested",
-        re.compile(r"不感兴趣|减少推荐|少推荐|not[\s_-]*interested|dislike", re.I),
-    ),
-    (
-        "like_off",
-        re.compile(r"已点赞|取消点赞|撤销点赞|\bunlike\b|like[\s_-]*(?:on|selected|active)", re.I),
-    ),
-    (
-        "like_on",
-        re.compile(r"点赞|点个赞|赞一下|\blike\b|(?:^|[_./-])like(?:[_./-]|$)", re.I),
-    ),
-    (
-        "social_state",
-        re.compile(r"收藏|关注|预约|加入购物车|favorite|follow|book\b", re.I),
-    ),
-)
-
-_TASK_AUTH_PATTERNS: dict[str, re.Pattern[str]] = {
-    "financial": re.compile(
-        r"付款|支付|购买|买(?:一|个|件|张|份)?|下单|充值|转账|开通会员|续费|订阅|"
-        r"pay\b|purchase|buy\b|checkout|subscribe",
-        re.IGNORECASE,
-    ),
-    "authentication": re.compile(
-        r"登录|输入密码|验证码|身份验证|人脸|指纹|log\s*in|sign\s*in|verify",
-        re.IGNORECASE,
-    ),
-    "destructive": re.compile(
-        r"删除|清空|注销|卸载|格式化|恢复出厂|delete|clear|remove|uninstall|format",
-        re.IGNORECASE,
-    ),
-    "external_write": re.compile(
-        r"发送|发表|发布|评论|回复|留言|提交表单|send|post|publish|comment|reply",
-        re.IGNORECASE,
-    ),
-    "social_state": re.compile(
-        r"收藏|关注|预约|加入购物车|favorite|follow|book",
-        re.IGNORECASE,
-    ),
-    "not_interested": re.compile(
-        r"不感兴趣|减少推荐|少推荐|not[\s_-]*interested|dislike",
-        re.IGNORECASE,
-    ),
-}
 
 _PAYMENT_APP_MARKERS = (
     "alipay",
@@ -137,39 +49,6 @@ _MUTATING_ACTIONS = frozenset(
 
 
 @dataclass(frozen=True)
-class TaskContract:
-    task: str
-    authorized_effects: frozenset[str]
-
-    def authorizes(self, effect: str) -> bool:
-        return effect in self.authorized_effects
-
-    def mentions_payment_app(self) -> bool:
-        task_lower = self.task.lower()
-        return any(marker in task_lower for marker in _PAYMENT_APP_TASK_NAMES)
-
-
-@dataclass(frozen=True)
-class GuardVerdict:
-    allowed: bool
-    reason: str
-    effect: str | None = None
-    target_text: str = ""
-    target_node: dict[str, Any] | None = None
-    goal_already_satisfied: bool = False
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "allowed": self.allowed,
-            "reason": self.reason,
-            "effect": self.effect,
-            "target_text": self.target_text,
-            "target_node": self.target_node,
-            "goal_already_satisfied": self.goal_already_satisfied,
-        }
-
-
-@dataclass(frozen=True)
 class TransitionVerdict:
     status: str
     reason: str
@@ -187,105 +66,18 @@ class TransitionVerdict:
         }
 
 
-def build_task_contract(task: str) -> TaskContract:
-    normalized = str(task or "").strip()
-    authorized = {
-        effect for effect, pattern in _TASK_AUTH_PATTERNS.items() if pattern.search(normalized)
-    }
-    if task_requests_like_off(normalized):
-        authorized.add("like_off")
-    elif task_requests_like_on(normalized):
-        authorized.add("like_on")
-    return TaskContract(task=normalized, authorized_effects=frozenset(authorized))
-
-
-def guard_action(
-    action: Action,
-    observation: Observation,
-    contract: TaskContract,
-) -> GuardVerdict:
-    """Check a proposed action immediately before device execution."""
-    target_text, target_node = _action_target(action, observation)
-    page_text = observation_text(observation)
-    app = str(observation.foreground_app or "")
-
-    if action.action_type in {
-        "back",
-        "home",
-        "app_switch",
-        "wait",
-        "screenshot",
-        "inspect",
-        "done",
-    }:
-        return GuardVerdict(True, "non_mutating_navigation", target_text=target_text)
-
-    if _is_payment_app(app) and not (
-        contract.authorizes("financial") or contract.mentions_payment_app()
-    ):
-        goal_satisfied = playback_goal_satisfied(contract.task, observation)
-        return GuardVerdict(
-            False,
-            "payment_app_outside_task_scope",
-            effect="financial",
-            target_text=target_text,
-            target_node=target_node,
-            goal_already_satisfied=goal_satisfied,
-        )
-
-    if action.action_type == "open_app" and _is_payment_app(action.text or "") and not (
-        contract.authorizes("financial") or contract.mentions_payment_app()
-    ):
-        return GuardVerdict(
-            False,
-            "payment_app_outside_task_scope",
-            effect="financial",
-            target_text=action.text or "",
-        )
-
-    candidate_text = target_text
-    if action.action_type in {"open_app", "open_deeplink", "open_intent"}:
-        candidate_text = " ".join(
-            part for part in (target_text, action.text or "") if str(part).strip()
-        )
-    effect = _detect_risk_effect(candidate_text)
-    if effect is None and action.action_type == "input_text":
-        effect = _detect_risk_effect(_focused_text(observation))
-
-    if effect is not None and not contract.authorizes(effect):
-        return GuardVerdict(
-            False,
-            f"{effect}_effect_not_authorized_by_task",
-            effect=effect,
-            target_text=target_text,
-            target_node=target_node,
-            goal_already_satisfied=(
-                (effect == "financial" and playback_goal_satisfied(contract.task, observation))
-                or (effect == "like_off" and contract.authorizes("like_on"))
-            ),
-        )
-
-    return GuardVerdict(
-        True,
-        "authorized_or_low_risk",
-        effect=effect,
-        target_text=target_text,
-        target_node=target_node,
-    )
-
-
 class TransitionMonitor:
     """Detect no-op transitions and short cycles regardless of action type."""
 
     def __init__(
         self,
         initial_observation: Observation,
-        contract: TaskContract,
+        task: str,
         *,
         no_progress_limit: int = 3,
         history_size: int = 8,
     ) -> None:
-        self._contract = contract
+        self._task = str(task or "")
         self._no_progress_limit = max(2, int(no_progress_limit))
         self._states: deque[str] = deque(
             [observation_state_id(initial_observation)], maxlen=max(6, int(history_size))
@@ -306,7 +98,7 @@ class TransitionMonitor:
         if (
             not _is_payment_app(before_app)
             and _is_payment_app(after_app)
-            and not (self._contract.authorizes("financial") or self._contract.mentions_payment_app())
+            and not _task_authorizes_payment(self._task)
         ):
             self._states.append(after_state)
             return TransitionVerdict(
@@ -415,92 +207,16 @@ def observation_text(observation: Observation) -> str:
     return " ".join(values)
 
 
-def _action_target(
-    action: Action,
-    observation: Observation,
-) -> tuple[str, dict[str, Any] | None]:
-    if action.action_type not in _COORDINATE_ACTIONS:
-        return "", None
-    point = _first_action_point(action, observation)
-    if point is None:
-        return "", None
-    x, y = point
-    nearby: list[tuple[float, int, dict[str, Any], str]] = []
-    threshold = max(72.0, math.hypot(observation.screen_width, observation.screen_height) * 0.04)
-    for node in observation.extra.get("ui_tree") or []:
-        if not isinstance(node, dict):
-            continue
-        bounds = _parse_bounds(node.get("bounds"))
-        if bounds is None:
-            continue
-        label = " ".join(
-            str(node.get(key)).strip()
-            for key in ("text", "content_desc", "resource_id")
-            if str(node.get(key) or "").strip()
-        )
-        if not label:
-            continue
-        distance = _distance_to_rect(x, y, bounds)
-        if distance <= threshold:
-            area = max(1, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]))
-            nearby.append((distance, area, node, label))
-    if not nearby:
-        return "", None
-    nearby.sort(key=lambda item: (item[0], item[1]))
-    primary = nearby[0][2]
-    labels: list[str] = []
-    for _distance, _area, _node, label in nearby[:4]:
-        if label not in labels:
-            labels.append(label)
-    return " | ".join(labels), dict(primary)
-
-
-def _first_action_point(action: Action, observation: Observation) -> tuple[int, int] | None:
-    if action.x is not None and action.y is not None:
-        return (
-            resolve_coordinate(action.x, observation.screen_width, relative=action.relative),
-            resolve_coordinate(action.y, observation.screen_height, relative=action.relative),
-        )
-    if action.points:
-        x, y = action.points[0]
-        return (
-            resolve_coordinate(x, observation.screen_width, relative=action.relative),
-            resolve_coordinate(y, observation.screen_height, relative=action.relative),
-        )
-    return None
-
-
-def _parse_bounds(value: Any) -> tuple[int, int, int, int] | None:
-    match = _BOUNDS_RE.fullmatch(str(value or "").strip())
-    if match is None:
-        return None
-    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
-
-
-def _distance_to_rect(x: int, y: int, bounds: tuple[int, int, int, int]) -> float:
-    x1, y1, x2, y2 = bounds
-    dx = max(x1 - x, 0, x - x2)
-    dy = max(y1 - y, 0, y - y2)
-    return math.hypot(dx, dy)
-
-
-def _detect_risk_effect(text: str) -> str | None:
-    for effect, pattern in _RISK_PATTERNS:
-        if pattern.search(text or ""):
-            return effect
-    return None
-
-
-def _focused_text(observation: Observation) -> str:
-    values = observation.extra.get("focused_text")
-    if isinstance(values, list):
-        return " ".join(str(value) for value in values)
-    return str(values or "")
-
-
 def _is_payment_app(app: str) -> bool:
     normalized = str(app or "").lower()
     return any(marker in normalized for marker in _PAYMENT_APP_MARKERS)
+
+
+def _task_authorizes_payment(task: str) -> bool:
+    normalized = str(task or "").lower()
+    return any(marker in normalized for marker in _PAYMENT_APP_TASK_NAMES) or bool(
+        re.search(r"付款|支付|购买|下单|充值|转账|pay\b|purchase|buy\b|checkout", normalized)
+    )
 
 
 def playback_goal_is_active(task: str, observation: Observation) -> bool:

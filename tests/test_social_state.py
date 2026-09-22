@@ -11,7 +11,6 @@ from vlaclaw.action import Action
 from vlaclaw.agent import GuiAgent
 from vlaclaw.agents.profiles import parse_profile_action
 from vlaclaw.backends.adb import _parse_ui_tree_xml
-from vlaclaw.control import build_task_contract, guard_action
 from vlaclaw.interfaces import LLMResponse
 from vlaclaw.observation import Observation
 from vlaclaw.social_state import (
@@ -26,52 +25,9 @@ from vlaclaw.social_state import (
 from vlaclaw.trajectory.recorder import TrajectoryRecorder
 
 
-def test_like_task_contract_is_directional() -> None:
-    contract = build_task_contract("给当前视频点赞")
-    assert contract.authorizes("like_on")
-    assert not contract.authorizes("like_off")
-    assert not contract.authorizes("not_interested")
-
-    observation = Observation(
-        screenshot_path=None,
-        screen_width=100,
-        screen_height=200,
-        extra={
-            "ui_tree": [
-                {
-                    "content_desc": "不感兴趣",
-                    "clickable": True,
-                    "bounds": "[40,80][60,120]",
-                }
-            ]
-        },
-    )
-    verdict = guard_action(Action("tap", x=50, y=100), observation, contract)
-    assert verdict.allowed is False
-    assert verdict.effect == "not_interested"
+def test_like_task_detection_excludes_read_only_and_negated_requests() -> None:
     assert not task_requests_like_on("查看当前视频的点赞数")
     assert not task_requests_like_on("打开视频但不要点赞")
-
-
-def test_already_liked_semantics_satisfy_like_on_without_tap() -> None:
-    contract = build_task_contract("点赞")
-    observation = Observation(
-        screenshot_path=None,
-        screen_width=100,
-        screen_height=200,
-        extra={
-            "ui_tree": [
-                {
-                    "content_desc": "已点赞",
-                    "selected": True,
-                    "bounds": "[40,80][60,120]",
-                }
-            ]
-        },
-    )
-    verdict = guard_action(Action("tap", x=50, y=100), observation, contract)
-    assert verdict.allowed is False
-    assert verdict.goal_already_satisfied is True
 
 
 def test_accessibility_parser_keeps_checked_and_selected_state() -> None:
@@ -241,34 +197,3 @@ def _run_like_agent(tmp_path: Path, state: str, *, actor_action: str = "click"):
     )
     result = asyncio.run(agent.run("给当前内容点赞", max_retries=1))
     return result, backend, llm
-
-
-def test_like_tap_requires_unliked_then_verifies_liked(tmp_path: Path) -> None:
-    assert task_requests_like_on("给当前内容点赞")
-    result, backend, llm = _run_like_agent(tmp_path, LIKE_UNLIKED)
-    assert result.success is True
-    assert len(backend.executed) == 1
-    assert llm.actor_image_sizes == [(100, 200)]
-    assert llm.crop_sizes == [(384, 384), (384, 384)]
-
-
-def test_slash_heart_is_blocked_without_execution(tmp_path: Path) -> None:
-    result, backend, llm = _run_like_agent(tmp_path, LIKE_NOT_INTERESTED)
-    assert result.success is False
-    assert backend.executed == []
-    assert llm.crop_sizes == [(384, 384)]
-    assert result.error and "not_interested_is_not_like" in result.error
-
-
-def test_inspect_of_filled_heart_completes_without_toggling(tmp_path: Path) -> None:
-    result, backend, llm = _run_like_agent(tmp_path, LIKE_LIKED, actor_action="inspect")
-    assert result.success is True
-    assert backend.executed == []
-    assert llm.crop_sizes == [(384, 384)]
-
-
-def test_inspect_of_outline_heart_is_promoted_to_verified_tap(tmp_path: Path) -> None:
-    result, backend, llm = _run_like_agent(tmp_path, LIKE_UNLIKED, actor_action="inspect")
-    assert result.success is True
-    assert [action.action_type for action in backend.executed] == ["tap"]
-    assert llm.crop_sizes == [(384, 384), (384, 384)]
